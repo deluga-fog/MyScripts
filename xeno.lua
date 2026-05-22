@@ -82,26 +82,92 @@ local function Kill(d)
 end
 
 -- ---- Click helpers (for TriggerBot) ----
-local function DoClick()
-    if not Exec.canClick then return end
+local ClickMethod = "none"
+local function InitClickMethod()
+    -- try mouse1press first (most common)
+    if typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
+        local ok = pcall(function()
+            -- test if it works without crashing
+            return mouse1press and mouse1release
+        end)
+        if ok then
+            ClickMethod = "mouse1press"
+            return
+        end
+    end
+    -- try VirtualInputManager
+    if VIM and typeof(VIM) == "Instance" then
+        local ok = pcall(function()
+            return VIM:IsA("VirtualInputManager")
+        end)
+        if ok then
+            ClickMethod = "vim"
+            return
+        end
+    end
+    -- try getting VIM differently
     pcall(function()
-        if typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
+        local vim2 = game:GetService("VirtualInputManager")
+        if vim2 then
+            VIM = vim2
+            ClickMethod = "vim"
+        end
+    end)
+    if ClickMethod ~= "none" then return end
+    -- no click method available
+    ClickMethod = "none"
+    Exec.canClick = false
+end
+
+local function DoClick()
+    if ClickMethod == "none" then return false end
+    
+    local success = false
+    
+    if ClickMethod == "mouse1press" then
+        local ok1 = pcall(function()
             mouse1press()
+        end)
+        if ok1 then
+            success = true
             task.delay(0.03, function()
-                pcall(mouse1release)
+                pcall(function()
+                    mouse1release()
+                end)
             end)
-        elseif typeof(VIM) == "Instance" then
+        else
+            -- method failed, disable it
+            ClickMethod = "none"
+            Exec.canClick = false
+        end
+    elseif ClickMethod == "vim" then
+        local ok1 = pcall(function()
             VIM:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+        end)
+        if ok1 then
+            success = true
             task.delay(0.03, function()
                 pcall(function()
                     VIM:SendMouseButtonEvent(0, 0, 0, false, game, 1)
                 end)
             end)
+        else
+            -- method failed, disable it
+            ClickMethod = "none"
+            Exec.canClick = false
         end
-    end)
+    end
+    
+    return success
 end
 
-Notify("XENO", "Loading v17.2 [Eclipse]...", 3)
+-- initialize click method on load
+task.spawn(function()
+    task.wait(0.1)
+    InitClickMethod()
+end)
+
+Notify("XENO", "Loading v17.3 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -447,15 +513,21 @@ end
 
 -- ---- Trigger Bot ----
 local function UpdateTriggerBot()
+    -- safety checks
+    if DEAD then return end
     if not Cfg.TriggerBot.On then return end
-    if not Exec.canClick then return end
+    if ClickMethod == "none" then return end
     if not Cfg.Aim.On then return end
     if not S.tgt.part or not S.tgt.vis then return end
+    if not S.me.alive then return end
     
     -- check ADS if required
     if Cfg.TriggerBot.OnlyADS then
-        local rmb = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
-        if not rmb then return end
+        local ok, rmb = pcall(function()
+            return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+        end)
+        -- if check fails (mobile server), skip ADS requirement
+        if ok and not rmb then return end
     end
     
     -- check if target is actually on screen center (within small threshold)
@@ -477,12 +549,21 @@ local function UpdateTriggerBot()
     local burstCount = math.clamp(Cfg.TriggerBot.BurstCount, 1, 10)
     
     if burstCount == 1 then
-        DoClick()
+        local ok = DoClick()
+        if not ok then
+            -- click failed, disable triggerbot
+            Cfg.TriggerBot.On = false
+        end
     else
         task.spawn(function()
             for i = 1, burstCount do
                 if DEAD then break end
-                DoClick()
+                if ClickMethod == "none" then break end
+                local ok = DoClick()
+                if not ok then
+                    Cfg.TriggerBot.On = false
+                    break
+                end
                 if i < burstCount then
                     task.wait(Cfg.TriggerBot.BurstDelay)
                 end
@@ -1072,8 +1153,17 @@ function HUD.Update()
     end
     if d.tb then
         if Cfg.TriggerBot.On then
+            local status = "TRIGGER BOT ON"
+            if ClickMethod == "none" then
+                status = "TRIGGER BOT [NO CLICK]"
+            end
             pcall(function()
-                d.tb.Text = "TRIGGER BOT ON"
+                d.tb.Text = status
+                if ClickMethod == "none" then
+                    d.tb.Color = Color3.fromRGB(255, 100, 100)
+                else
+                    d.tb.Color = Color3.fromRGB(255, 200, 50)
+                end
                 d.tb.Visible = true
             end)
         else
@@ -1289,7 +1379,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextLabel", main)
-    tl.Text = "XENO v17.2 [Eclipse]"
+    tl.Text = "XENO v17.3 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -1809,7 +1899,7 @@ local function BuildGUI()
     local silentStr = "N"
     if Exec.canSilent then silentStr = "Y" end
     local clickStr = "N"
-    if Exec.canClick then clickStr = "Y" end
+    if Exec.canClick and ClickMethod ~= "none" then clickStr = ClickMethod end
     il.Text = Exec.name .. " | Silent: " .. silentStr .. " | Click: " .. clickStr
     il.Size = UDim2.new(1, 0, 0, 18)
     il.BackgroundTransparency = 1
@@ -2191,4 +2281,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.2", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v17.3", "Loaded [Eclipse]. Tap X button to open menu.", 5)
