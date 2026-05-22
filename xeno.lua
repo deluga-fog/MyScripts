@@ -1,65 +1,41 @@
 -- =====================================================================
--- XENO PROJECT v17.5 [OFFICIAL MONOLITH]
--- Compiled for: Old Executors (Lua 5.1 Syntax)
--- Silent Aim: __namecall ONLY (Optimized FPS)
--- UI Engine: v16.1 Full Restore (7 Tabs + RGB)
+-- XENO v17.5 [OFFICIAL FULL MONOLITH]
+-- Engine: v10.1 (Drawing API, batching, reusable objects = NO FPS DROPS)
+-- UI:     v16.1 (7 tabs, RGB picker, PERF tab, smoothness fixed)
+-- Parser: works on Lua 5.1 (No compound ops, no continue, no task.wait)
 -- =====================================================================
 
--- ---- Cleanup Logic ----
+-- ---- Cleanup previous load ----
 if _G.XenoLoaded and _G.XenoCleanup then 
-    local ok, err = pcall(_G.XenoCleanup)
+    pcall(_G.XenoCleanup)
     wait(0.3)
 end
 _G.XenoLoaded = true
 
 -- ---- Services ----
-local Players      = game:GetService("Players")
-local UIS          = game:GetService("UserInputService")
-local RunService   = game:GetService("RunService")
-local WS           = game:GetService("Workspace")
-local StarterGui   = game:GetService("StarterGui")
-local CoreGui      = game:GetService("CoreGui")
-local TweenService = game:GetService("TweenService")
+local Players    = game:GetService("Players")
+local UIS        = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local WS         = game:GetService("Workspace")
+local StarterGui = game:GetService("StarterGui")
+local CoreGui    = game:GetService("CoreGui")
 
-local Plr    = Players.LocalPlayer
-local Cam    = WS.CurrentCamera
-local Mouse  = Plr:GetMouse()
-local IsMobile = (UIS.TouchEnabled and not UIS.KeyboardEnabled)
+local Plr   = Players.LocalPlayer
+local Cam   = WS.CurrentCamera
+local Mouse = Plr:GetMouse()
+local IsMobile = UIS.TouchEnabled and not UIS.KeyboardEnabled
+local function SC(p, m) if IsMobile then return m end return p end
 
--- ---- Core Helper Functions ----
-local function SC(p, m) 
-    if IsMobile then return m end 
-    return p 
-end
-
-local function Notify(title, msg, dur)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {Title = title, Text = msg or "", Duration = dur or 4})
-    end)
-end
-
-local function SafeP()
-    if typeof(gethui) == "function" then
-        local ok, res = pcall(gethui)
-        if ok and res then return res end
-    end
-    if CoreGui then
-        local ok = pcall(function() local t = Instance.new("Folder"); t.Parent = CoreGui; t:Destroy() end)
-        if ok then return CoreGui end
-    end
-    return Plr:WaitForChild("PlayerGui")
-end
-
-local function Protect(g)
-    if typeof(syn) == "table" and syn.protect_gui then pcall(syn.protect_gui, g) end
-    if typeof(protect_gui) == "function" then pcall(protect_gui, g) end
-end
-
--- ---- Executor Capabilities ----
-local Exec = {name = "Unknown", canSilent = false}
+-- ---- Executor probe ----
+local Exec = {name = "Unknown", canSilent = false, canCoreGui = false}
 pcall(function()
-    if identifyexecutor then Exec.name = identifyexecutor() 
-    elseif getexecutorname then Exec.name = getexecutorname() end
+    if identifyexecutor then Exec.name = identifyexecutor() end
+end)
+pcall(function()
+    local t = Instance.new("Folder")
+    t.Parent = CoreGui
+    t:Destroy()
+    Exec.canCoreGui = true
 end)
 Exec.canSilent = (typeof(hookmetamethod) == "function") and (typeof(getnamecallmethod) == "function")
 
@@ -71,10 +47,33 @@ pcall(function()
     drawOK = true
 end)
 
+local DEAD = false
+
+-- ---- Helpers ----
+local function Notify(title, msg, dur)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {Title = title, Text = msg or "", Duration = dur or 4})
+    end)
+end
+
+local function SafeP()
+    if Exec.canCoreGui then return CoreGui end
+    if typeof(gethui) == "function" then
+        local o, r = pcall(gethui)
+        if o and r then return r end
+    end
+    return Plr:WaitForChild("PlayerGui")
+end
+
+local function Protect(g)
+    if typeof(syn) == "table" and syn.protect_gui then pcall(syn.protect_gui, g) end
+    if typeof(protect_gui) == "function" then pcall(protect_gui, g) end
+end
+
 local function ND(t)
     if not drawOK then return nil end
-    local ok, d = pcall(Drawing.new, t)
-    if not ok or not d then return nil end
+    local s, d = pcall(Drawing.new, t)
+    if not s or not d then return nil end
     pcall(function() d.Visible = false end)
     return d
 end
@@ -86,17 +85,14 @@ local function Kill(d)
     pcall(function() d:Destroy() end)
 end
 
-local DEAD = false
-
--- ---- Config Table (Cfg) ----
+-- ---- Config ----
 local Cfg = {
-    On = false,
     Aim = {
-        Mode = "Silent", -- Normal, Snap, Silent
+        On = false,
+        Mode = "Silent", -- Minimal, Normal, Silent
         Part = "Head",
         FOV = 120,
         FOVOn = true,
-        ShowFOV = true,
         Smooth = 30,
         Speed = 1.0,
         Prediction = true,
@@ -105,48 +101,16 @@ local Cfg = {
         Sticky = true,
         Aim360 = false,
     },
-    Silent = {
-        On = Exec.canSilent,
-        Chance = 100,
-        Use360 = false
-    },
     ESP = {
         On = false,
         MaxDist = 1500,
         ShowTeam = false,
     },
-    Box = {
-        On = true, 
-        Style = "Corner", 
-        Thickness = 1, 
-        Outline = true, 
-        Color = Color3.fromRGB(255, 50, 50), 
-        TeamColor = Color3.fromRGB(50, 255, 50),
-        CL = 0.25
-    },
-    Name = {
-        On = true, 
-        Size = 13, 
-        Format = "Name+Dist", 
-        Color = Color3.fromRGB(255, 255, 255), 
-        TeamColor = Color3.fromRGB(255, 255, 255)
-    },
-    HP = {
-        On = true, 
-        Width = 3, 
-        Offset = 5, 
-        BgColor = Color3.fromRGB(25, 25, 25)
-    },
-    Tracer = {
-        On = false, 
-        Thickness = 1.5, 
-        Color = Color3.fromRGB(255, 80, 80)
-    },
-    HeadDot = {
-        On = false, 
-        Radius = 4, 
-        Color = Color3.fromRGB(255, 255, 255)
-    },
+    Box = {On = true, Style = "Corner", Thickness = 1, Outline = true, Color = Color3.fromRGB(255, 50, 50), TeamColor = Color3.fromRGB(50, 255, 50), CL = 0.25},
+    Name = {On = true, Size = 13, Format = "Name+Dist", Color = Color3.fromRGB(255, 255, 255), TeamColor = Color3.fromRGB(255, 255, 255)},
+    HP = {On = true, Width = 3, Offset = 5, BgColor = Color3.fromRGB(25, 25, 25)},
+    Tracer = {On = false, Thickness = 1.5, Color = Color3.fromRGB(255, 80, 80)},
+    HeadDot = {On = false, Radius = 4, Color = Color3.fromRGB(255, 255, 255)},
     WH = {
         On = false,
         ShowTeam = false,
@@ -175,14 +139,10 @@ local Cfg = {
     },
 }
 
--- ---- State Table (S) ----
+-- ---- State ----
 local S = {
-    tgt = {
-        part = nil, plr = nil, dist = 0, hp = 0, mhp = 0, 
-        name = "", vis = false, lastT = 0, lastPos = nil, vel = Vector3.new(0,0,0)
-    },
+    tgt = {part = nil, plr = nil, dist = 0, hp = 0, mhp = 0, name = "", vis = false, lastT = 0, lastPos = nil, vel = Vector3.new(0,0,0)},
     me  = {char = nil, hum = nil, root = nil, alive = false},
-    aim = {hooked = false},
     magic = {on = false, target = nil, hookInstalled = false},
     esp  = {},
     wh   = {},
@@ -200,7 +160,7 @@ local S = {
     fpsLast = tick(),
 }
 
--- ---- Math & Raycast Helpers ----
+-- ---- Geometry helpers ----
 local function W2S(pos)
     if not Cam then Cam = WS.CurrentCamera end
     if not Cam then return nil, false end
@@ -217,8 +177,7 @@ end
 local function SDist(wp)
     local sp, on = W2S(wp)
     if not sp or not on then return 9999 end
-    local center = ScrC()
-    return (sp - center).Magnitude
+    return (sp - ScrC()).Magnitude
 end
 
 local function HPCol(pct)
@@ -250,23 +209,27 @@ end
 
 local function CanSee(part, myCh)
     if not part or not myCh or not Cam then return true end
-    local origin = Cam.CFrame.Position
-    local tp = part.Position
-    local dir = tp - origin
-    local dist = dir.Magnitude
-    if dist < 3 then return true end
-    local par = RaycastParams.new()
-    par.FilterType = Enum.RaycastFilterType.Exclude
-    local tCh = part.Parent
-    if tCh then par.FilterDescendantsInstances = {myCh, tCh}
-    else par.FilterDescendantsInstances = {myCh} end
-    par.RespectCanCollide = false
-    local r = WS:Raycast(origin, dir.Unit * (dist - 1), par)
-    if not r then return true end
-    return r.Instance.Transparency >= 0.5 or not r.Instance.CanCollide
+    local ok, res = pcall(function()
+        local origin = Cam.CFrame.Position
+        local tp = part.Position
+        local dir = tp - origin
+        local dist = dir.Magnitude
+        if dist < 3 then return true end
+        local par = RaycastParams.new()
+        par.FilterType = Enum.RaycastFilterType.Exclude
+        local tCh = part.Parent
+        if tCh then par.FilterDescendantsInstances = {myCh, tCh}
+        else par.FilterDescendantsInstances = {myCh} end
+        par.RespectCanCollide = false
+        local r = WS:Raycast(origin, dir.Unit * (dist - 1), par)
+        if not r then return true end
+        return r.Instance.Transparency >= 0.5 or not r.Instance.CanCollide
+    end)
+    if ok then return res end
+    return true
 end
 
--- ---- Player Setup ----
+-- ---- Char setup ----
 local function SetupChar()
     local function onChar(ch)
         if DEAD then return end
@@ -274,17 +237,19 @@ local function SetupChar()
         S.me.alive = false
         S.tgt.part = nil
         S.tgt.plr = nil
+        S.tpRot = 0
         local hum, root
-        pcall(function() hum = ch:WaitForChild("Humanoid", 10) end)
+        pcall(function() hum  = ch:WaitForChild("Humanoid", 10) end)
         pcall(function() root = ch:WaitForChild("HumanoidRootPart", 10) end)
         if not hum or not root then return end
-        S.me.hum = hum
+        S.me.hum  = hum
         S.me.root = root
         S.me.alive = true
         hum.Died:Connect(function()
             S.me.alive = false
             S.tgt.part = nil
             S.tgt.plr = nil
+            S.tpRot = 0
         end)
     end
     if Plr.Character then onChar(Plr.Character) end
@@ -319,7 +284,7 @@ local function GetAng(p)
     return math.deg(math.acos(math.clamp(dot, -1, 1)))
 end
 
--- ---- Prediction Logic ----
+-- ---- PredPos Logic ----
 local function PredPos(p)
     if not p then return Vector3.new(0,0,0) end
     if not Cfg.Aim.Prediction then return p.Position end
@@ -332,7 +297,7 @@ local function PredPos(p)
     return cur + S.tgt.vel * Cfg.Aim.PredFactor
 end
 
--- ---- Find Target Engine ----
+-- ---- Find Target ----
 local function FindTarget()
     if not S.me.alive or not Cam then return nil, nil end
     local is360 = Cfg.Aim.Aim360
@@ -415,7 +380,7 @@ local function ApplyAim(p)
     end
 end
 
--- ---- Silent Aim (__namecall) ----
+-- ---- Silent Aim (__namecall only) ----
 local function InstallSilent()
     if S.aim.hooked or not Exec.canSilent then return end
     local wrap = (newcclosure or function(f) return f end)
@@ -425,7 +390,7 @@ local function InstallSilent()
             if DEAD then return oldNc(self, ...) end
             local m = getnamecallmethod()
             
-            if Cfg.On and Cfg.Silent.On and Cfg.Aim.Mode == "Silent" and S.tgt.part then
+            if Cfg.Aim.On and Cfg.Silent.On and Cfg.Aim.Mode == "Silent" and S.tgt.part then
                 local tp = PredPos(S.tgt.part)
                 if tp then
                     if m == "Raycast" and self == WS then
@@ -592,7 +557,7 @@ function WH.Update()
     end
 end
 
--- ---- UI Building ----
+-- ---- UI Building (FULL v16.1 Restore) ----
 local function BuildGUI()
     if S.gui then pcall(function() S.gui:Destroy() end) end
     S.theme = {accent = {}, bg = {}, panel = {}, text = {}, textDim = {}, btnBad = {}}
@@ -745,7 +710,7 @@ local function MainLoop()
             S.me.hum.WalkSpeed = 16 * Cfg.Speed.Mult 
         end
         
-        -- ESP Engine (Full list, no batching as requested)
+        -- ESP Engine
         if Cfg.ESP.On then
             local plrs = S.plList
             for i = 1, #plrs do
@@ -770,7 +735,7 @@ local function MainLoop()
             if S.draw.fov then 
                 S.draw.fov.Position = ScrC(); 
                 S.draw.fov.Radius = Cfg.Aim.FOV; 
-                S.draw.fov.Visible = (Cfg.On and Cfg.Aim.FOVOn and Cfg.Aim.ShowFOV) 
+                S.draw.fov.Visible = (Cfg.On and Cfg.Aim.FOVOn) 
                 S.draw.fov.Color = Cfg.UI.Accent
             end
         end
@@ -787,7 +752,6 @@ local function Cleanup()
     E.DelAll()
     for uid, h in pairs(S.wh) do pcall(function() h:Destroy() end) end
     if S.gui then pcall(function() S.gui:Destroy() end) end
-    for k, d in pairs(S.draw) do Kill(d) end
     if S.me.hum then S.me.hum.WalkSpeed = 16 end
     _G.XenoLoaded = false; _G.XenoCleanup = nil
 end
@@ -805,4 +769,3 @@ BuildGUI(); MainLoop()
 if Cfg.Silent.On then InstallSilent() end
 
 Notify("XENO v17.5", "Loaded successfully. Mode: Lua 5.1", 5)
-
