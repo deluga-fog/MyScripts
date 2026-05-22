@@ -45,6 +45,127 @@ end)
 
 local DEAD = false
 
+-- ---- Debug Log System ----
+local DebugLog = {
+    entries = {},
+    maxEntries = 100,
+    hookStats = {
+        installed = false,
+        totalCalls = 0,
+        wsCalls = 0,
+        camCalls = 0,
+        redirects = 0,
+        errors = {},
+        lastCallTime = 0,
+    },
+}
+
+local function Log(category, message)
+    local entry = string.format("[%.2f][%s] %s", tick() % 1000, category, tostring(message))
+    table.insert(DebugLog.entries, entry)
+    if #DebugLog.entries > DebugLog.maxEntries then
+        table.remove(DebugLog.entries, 1)
+    end
+end
+
+local function LogError(category, err)
+    local entry = string.format("[%.2f][ERROR:%s] %s", tick() % 1000, category, tostring(err))
+    table.insert(DebugLog.entries, entry)
+    table.insert(DebugLog.hookStats.errors, entry)
+    if #DebugLog.hookStats.errors > 20 then
+        table.remove(DebugLog.hookStats.errors, 1)
+    end
+end
+
+local function GetDebugReport()
+    local lines = {}
+    table.insert(lines, "===== XENO v17.7 DEBUG REPORT =====")
+    table.insert(lines, "Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
+    table.insert(lines, "")
+    
+    -- Executor info
+    table.insert(lines, "-- EXECUTOR --")
+    table.insert(lines, "Name: " .. tostring(Exec.name))
+    table.insert(lines, "canSilent (hookmetamethod): " .. tostring(Exec.canSilent))
+    table.insert(lines, "canCoreGui: " .. tostring(Exec.canCoreGui))
+    table.insert(lines, "canClick: " .. tostring(Exec.canClick))
+    table.insert(lines, "Drawing API: " .. tostring(drawOK))
+    table.insert(lines, "")
+    
+    -- Available functions check
+    table.insert(lines, "-- FUNCTIONS CHECK --")
+    table.insert(lines, "hookmetamethod: " .. tostring(typeof(hookmetamethod) == "function"))
+    table.insert(lines, "getnamecallmethod: " .. tostring(typeof(getnamecallmethod) == "function"))
+    table.insert(lines, "newcclosure: " .. tostring(typeof(newcclosure) == "function"))
+    table.insert(lines, "setclipboard: " .. tostring(typeof(setclipboard) == "function"))
+    table.insert(lines, "")
+    
+    -- Hook stats
+    table.insert(lines, "-- HOOK STATS --")
+    table.insert(lines, "Hook installed: " .. tostring(DebugLog.hookStats.installed))
+    table.insert(lines, "Total calls: " .. tostring(DebugLog.hookStats.totalCalls))
+    table.insert(lines, "Workspace calls: " .. tostring(DebugLog.hookStats.wsCalls))
+    table.insert(lines, "Camera calls: " .. tostring(DebugLog.hookStats.camCalls))
+    table.insert(lines, "Redirects done: " .. tostring(DebugLog.hookStats.redirects))
+    table.insert(lines, "Last call: " .. string.format("%.2f sec ago", tick() - DebugLog.hookStats.lastCallTime))
+    table.insert(lines, "")
+    
+    -- Config state
+    table.insert(lines, "-- CONFIG STATE --")
+    table.insert(lines, "Aim.On: " .. tostring(Cfg.Aim.On))
+    table.insert(lines, "Aim.Mode: " .. tostring(Cfg.Aim.Mode))
+    table.insert(lines, "MagicBullet.On: " .. tostring(Cfg.MagicBullet.On))
+    table.insert(lines, "S.magic.on: " .. tostring(S.magic.on))
+    table.insert(lines, "S.magic.hookInstalled: " .. tostring(S.magic.hookInstalled))
+    table.insert(lines, "")
+    
+    -- Target state
+    table.insert(lines, "-- TARGET STATE --")
+    table.insert(lines, "S.tgt.part: " .. tostring(S.tgt.part))
+    table.insert(lines, "S.tgt.plr: " .. tostring(S.tgt.plr and S.tgt.plr.Name or "nil"))
+    table.insert(lines, "S.tgt.vis: " .. tostring(S.tgt.vis))
+    table.insert(lines, "S.me.alive: " .. tostring(S.me.alive))
+    table.insert(lines, "S.me.root: " .. tostring(S.me.root))
+    table.insert(lines, "")
+    
+    -- Errors
+    if #DebugLog.hookStats.errors > 0 then
+        table.insert(lines, "-- ERRORS --")
+        for _, err in ipairs(DebugLog.hookStats.errors) do
+            table.insert(lines, err)
+        end
+        table.insert(lines, "")
+    end
+    
+    -- Recent log entries
+    table.insert(lines, "-- RECENT LOGS --")
+    local startIdx = math.max(1, #DebugLog.entries - 30)
+    for i = startIdx, #DebugLog.entries do
+        table.insert(lines, DebugLog.entries[i])
+    end
+    
+    table.insert(lines, "")
+    table.insert(lines, "===== END REPORT =====")
+    
+    return table.concat(lines, "\n")
+end
+
+local function CopyDebugLog()
+    local report = GetDebugReport()
+    if typeof(setclipboard) == "function" then
+        pcall(function()
+            setclipboard(report)
+        end)
+        Notify("DEBUG", "Log copied to clipboard!", 3)
+    else
+        -- fallback: print to console
+        print(report)
+        Notify("DEBUG", "Log printed to console (no clipboard)", 3)
+    end
+end
+
+Log("INIT", "Script starting...")
+
 -- ---- Helpers ----
 local function Notify(title, msg, dur)
     pcall(function()
@@ -167,7 +288,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v17.6 [Eclipse]...", 3)
+Notify("XENO", "Loading v17.7 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -650,31 +771,54 @@ local function GetSilentAimTarget()
 end
 
 local function InstallSilentHooks()
-    if S.magic.hookInstalled then return end
+    if S.magic.hookInstalled then 
+        Log("HOOK", "Already installed, skipping")
+        return 
+    end
+    
+    Log("HOOK", "Starting hook installation...")
+    Log("HOOK", "Exec.canSilent = " .. tostring(Exec.canSilent))
+    
     if not Exec.canSilent then
+        Log("HOOK", "FAILED: hookmetamethod not available")
         Notify("SILENT/MAGIC", "hookmetamethod not supported", 3)
         return
     end
     
     S.magic.hookInstalled = true
-    local wrap = newcclosure or function(f) return f end
+    DebugLog.hookStats.installed = true
     
-    -- Cached references for speed (avoid global lookups in hot path)
+    local wrap = newcclosure or function(f) return f end
+    Log("HOOK", "newcclosure available: " .. tostring(newcclosure ~= nil))
+    
+    -- Cached references for speed
     local cachedWS = WS
     local cachedCam = Cam
+    Log("HOOK", "Cached WS: " .. tostring(cachedWS))
+    Log("HOOK", "Cached Cam: " .. tostring(cachedCam))
     
-    pcall(function()
+    local hookSuccess, hookErr = pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            -- FAST PATH: 99.9% of calls hit this and exit immediately
-            -- Only Workspace raycasts and Camera CFrame reads matter
+            -- Stats (minimal overhead)
+            DebugLog.hookStats.totalCalls = DebugLog.hookStats.totalCalls + 1
+            DebugLog.hookStats.lastCallTime = tick()
+            
+            -- FAST PATH: exit if not WS or Cam
             if self ~= cachedWS and self ~= cachedCam then
                 return oldNc(self, ...)
             end
             
+            -- Track WS/Cam calls
+            if self == cachedWS then
+                DebugLog.hookStats.wsCalls = DebugLog.hookStats.wsCalls + 1
+            else
+                DebugLog.hookStats.camCalls = DebugLog.hookStats.camCalls + 1
+            end
+            
             if DEAD then return oldNc(self, ...) end
             
-            -- Check if anything is even enabled
+            -- Check if anything is enabled
             local magicOn = S.magic.on
             local silentOn = Cfg.Aim.On and Cfg.Aim.Mode == "Silent" and S.tgt.part ~= nil
             if not magicOn and not silentOn then
@@ -685,12 +829,10 @@ local function InstallSilentHooks()
             
             -- === WORKSPACE: redirect raycasts ===
             if magicOn and self == cachedWS then
-                -- Raycast (new API)
                 if method == "Raycast" then
                     local args = {...}
                     if #args >= 2 and typeof(args[1]) == "Vector3" then
                         local origin = args[1]
-                        -- quick distance check instead of multiple branches
                         local isPlayer = (S.me.root and (origin - S.me.root.Position).Magnitude < 50)
                             or (cachedCam and (origin - cachedCam.CFrame.Position).Magnitude < 10)
                         if isPlayer then
@@ -699,6 +841,7 @@ local function InstallSilentHooks()
                                 local d = tp.Position - origin
                                 if d.Magnitude > 0.001 then
                                     S.magic.target = tp
+                                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
                                     return oldNc(self, origin, d.Unit * args[2].Magnitude, select(3, ...))
                                 end
                             end
@@ -707,7 +850,6 @@ local function InstallSilentHooks()
                     return oldNc(self, ...)
                 end
                 
-                -- FindPartOnRay / WithIgnoreList / WithWhitelist (old API)
                 if method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
                     local args = {...}
                     if #args >= 1 and typeof(args[1]) == "Ray" then
@@ -721,6 +863,7 @@ local function InstallSilentHooks()
                                 local d = tp.Position - origin
                                 if d.Magnitude > 0.001 then
                                     S.magic.target = tp
+                                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
                                     return oldNc(self, Ray.new(origin, d.Unit * ray.Direction.Magnitude), select(2, ...))
                                 end
                             end
@@ -730,11 +873,12 @@ local function InstallSilentHooks()
                 end
             end
             
-            -- === CAMERA: fake CFrame for silent aim ===
+            -- === CAMERA: fake CFrame ===
             if silentOn and self == cachedCam then
                 if method == "GetRenderCFrame" or method == "GetCFrame" then
                     local tp = GetSilentAimTarget()
                     if tp then
+                        DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
                         return CFrame.lookAt(cachedCam.CFrame.Position, tp.Position)
                     end
                 end
@@ -742,28 +886,45 @@ local function InstallSilentHooks()
             
             return oldNc(self, ...)
         end))
+        Log("HOOK", "hookmetamethod __namecall SUCCESS")
     end)
     
-    -- Update cached camera ref when it changes
+    if not hookSuccess then
+        Log("HOOK", "hookmetamethod FAILED: " .. tostring(hookErr))
+        LogError("HOOK", hookErr)
+        DebugLog.hookStats.installed = false
+        S.magic.hookInstalled = false
+        Notify("HOOK ERROR", tostring(hookErr):sub(1, 50), 5)
+        return
+    end
+    
+    -- Update cached camera when it changes
     table.insert(S.conns, WS:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
         cachedCam = WS.CurrentCamera
+        Log("HOOK", "Camera updated: " .. tostring(cachedCam))
     end))
     
-    -- NO __index hook — it fires on every property read and kills FPS
-    
+    Log("HOOK", "Installation complete!")
     Notify("SILENT/MAGIC", "Hooks installed", 2)
 end
 
 local function ToggleMagicBullet()
+    Log("MAGIC", "Toggle called, current: " .. tostring(S.magic.on))
     S.magic.on = not S.magic.on
     Cfg.MagicBullet.On = S.magic.on
-    if S.magic.on and not S.magic.hookInstalled then InstallSilentHooks() end
+    Log("MAGIC", "New state: " .. tostring(S.magic.on))
+    if S.magic.on and not S.magic.hookInstalled then 
+        Log("MAGIC", "Installing hooks...")
+        InstallSilentHooks() 
+    end
     if not S.magic.on then S.magic.target = nil end
 end
 
 -- Install hooks when Silent mode is selected
 local function OnAimModeChanged(mode)
+    Log("AIM", "Mode changed to: " .. tostring(mode))
     if mode == "Silent" and not S.magic.hookInstalled then
+        Log("AIM", "Silent mode, installing hooks...")
         InstallSilentHooks()
     end
 end
@@ -1511,7 +1672,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextLabel", main)
-    tl.Text = "XENO v17.6 [Eclipse]"
+    tl.Text = "XENO v17.7 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2042,6 +2203,50 @@ local function BuildGUI()
     il.Font = Enum.Font.Gotham
     il.LayoutOrder = nOrd()
     table.insert(S.theme.textDim, il)
+    
+    -- DEBUG LOG BUTTON
+    local db = Instance.new("TextButton", tM)
+    db.Text = "📋 COPY DEBUG LOG"
+    db.Size = UDim2.new(1, 0, 0, SC(26, 32))
+    db.BackgroundColor3 = Color3.fromRGB(80, 80, 120)
+    db.TextColor3 = Color3.new(1, 1, 1)
+    db.TextSize = SC(11, 12)
+    db.Font = Enum.Font.GothamBold
+    db.AutoButtonColor = false
+    db.LayoutOrder = nOrd()
+    local dbc = Instance.new("UICorner", db)
+    dbc.CornerRadius = UDim.new(0, 5)
+    db.MouseButton1Click:Connect(function()
+        CopyDebugLog()
+    end)
+    
+    -- Hook stats label (updates live)
+    local hookLbl = Instance.new("TextLabel", tM)
+    hookLbl.Text = "Hook: checking..."
+    hookLbl.Size = UDim2.new(1, 0, 0, 14)
+    hookLbl.BackgroundTransparency = 1
+    hookLbl.TextColor3 = TXTD
+    hookLbl.TextSize = SC(8, 9)
+    hookLbl.Font = Enum.Font.Code
+    hookLbl.LayoutOrder = nOrd()
+    table.insert(S.theme.textDim, hookLbl)
+    
+    -- Update hook stats every second
+    task.spawn(function()
+        while not DEAD and hookLbl and hookLbl.Parent do
+            local stats = DebugLog.hookStats
+            local txt = string.format("Hook:%s | Calls:%d | WS:%d | Cam:%d | Redir:%d",
+                stats.installed and "Y" or "N",
+                stats.totalCalls,
+                stats.wsCalls,
+                stats.camCalls,
+                stats.redirects
+            )
+            pcall(function() hookLbl.Text = txt end)
+            task.wait(1)
+        end
+    end)
+    
     local ub = Instance.new("TextButton", tM)
     ub.Text = "UNLOAD"
     ub.Size = UDim2.new(1, 0, 0, SC(26, 32))
@@ -2415,4 +2620,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.6", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v17.7", "Loaded [Eclipse]. Tap X button to open menu.", 5)
