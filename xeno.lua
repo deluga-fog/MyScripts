@@ -9,6 +9,7 @@ local RunService = game:GetService("RunService")
 local WS         = game:GetService("Workspace")
 local StarterGui = game:GetService("StarterGui")
 local CoreGui    = game:GetService("CoreGui")
+local VIM        = game:GetService("VirtualInputManager")
 
 local Plr   = Players.LocalPlayer
 local Cam   = WS.CurrentCamera
@@ -17,7 +18,7 @@ local IsMobile = UIS.TouchEnabled and not UIS.KeyboardEnabled
 local function SC(p, m) if IsMobile then return m end return p end
 
 -- ---- Executor probe (Eclipse) ----
-local Exec = {name = "Eclipse", canSilent = false, canCoreGui = false}
+local Exec = {name = "Eclipse", canSilent = false, canCoreGui = false, canClick = false}
 pcall(function()
     if identifyexecutor then
         Exec.name = identifyexecutor()
@@ -32,6 +33,7 @@ pcall(function()
     Exec.canCoreGui = true
 end)
 Exec.canSilent = typeof(hookmetamethod) == "function"
+Exec.canClick = typeof(mouse1press) == "function" or typeof(VIM) == "Instance"
 
 local drawOK = false
 pcall(function()
@@ -79,7 +81,27 @@ local function Kill(d)
     pcall(function() d:Destroy() end)
 end
 
-Notify("XENO", "Loading v17.0 [Eclipse]...", 3)
+-- ---- Click helpers (for TriggerBot) ----
+local function DoClick()
+    if not Exec.canClick then return end
+    pcall(function()
+        if typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
+            mouse1press()
+            task.delay(0.03, function()
+                pcall(mouse1release)
+            end)
+        elseif typeof(VIM) == "Instance" then
+            VIM:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+            task.delay(0.03, function()
+                pcall(function()
+                    VIM:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+                end)
+            end)
+        end
+    end)
+end
+
+Notify("XENO", "Loading v17.1 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -95,6 +117,14 @@ local Cfg = {
         PredFactor = 0.12,
         Sticky = false,
         Aim360 = false,
+        VisCheck = true,  -- отдельная проверка видимости для аима
+    },
+    TriggerBot = {
+        On = false,
+        Delay = 0.05,       -- задержка между выстрелами
+        BurstCount = 1,     -- количество кликов за раз
+        BurstDelay = 0.02,  -- задержка между кликами в burst
+        OnlyADS = false,    -- только когда зумишь (RMB)
     },
     ESP = {
         On = false,
@@ -117,7 +147,11 @@ local Cfg = {
     },
     TP = {On = false, RotSpeed = 0.3, MaxAngle = 45},
     Spin = {On = false, Spd = 10},
-    Speed = {On = false, Mult = 1.5},
+    Speed = {
+        On = false,
+        Mult = 1.5,
+        Method = "CFrame",  -- "CFrame", "Velocity", "Teleport"
+    },
     Checks = {Team = true, Wall = true},
     Limits = {MaxDist = 800, MaxAngle = 90, MinDist = 5},
     MagicBullet = {On = false, Range = 300},
@@ -139,6 +173,8 @@ local S = {
     tgt = {part = nil, plr = nil, dist = 0, hp = 0, mhp = 0, name = "", vis = false, lastT = 0, lastPos = nil, vel = Vector3.zero},
     me  = {char = nil, hum = nil, root = nil, alive = false},
     magic = {on = false, target = nil, hookInstalled = false},
+    trigger = {lastShot = 0, shooting = false},
+    speed = {bodyVel = nil, originalWS = 16},
     esp  = {},
     wh   = {},
     draw = {},
@@ -153,6 +189,7 @@ local S = {
     spinAng = 0,
     fpsAvg = 60,
     fpsLast = tick(),
+    moveDir = Vector3.zero,
 }
 
 -- ---- Geometry helpers ----
@@ -235,6 +272,11 @@ local function SetupChar()
         S.tgt.part = nil
         S.tgt.plr = nil
         S.tpRot = 0
+        -- cleanup old speed hack objects
+        if S.speed.bodyVel then
+            pcall(function() S.speed.bodyVel:Destroy() end)
+            S.speed.bodyVel = nil
+        end
         local hum, root
         pcall(function() hum  = ch:WaitForChild("Humanoid", 10) end)
         pcall(function() root = ch:WaitForChild("HumanoidRootPart", 10) end)
@@ -242,11 +284,16 @@ local function SetupChar()
         S.me.hum  = hum
         S.me.root = root
         S.me.alive = true
+        S.speed.originalWS = hum.WalkSpeed
         hum.Died:Connect(function()
             S.me.alive = false
             S.tgt.part = nil
             S.tgt.plr = nil
             S.tpRot = 0
+            if S.speed.bodyVel then
+                pcall(function() S.speed.bodyVel:Destroy() end)
+                S.speed.bodyVel = nil
+            end
         end)
     end
     if Plr.Character then task.spawn(onChar, Plr.Character) end
@@ -292,6 +339,7 @@ local function FindTarget()
     if not S.me.alive then return nil, nil end
     if not Cam then return nil, nil end
     local is360 = Cfg.Aim.Aim360
+    local doVisCheck = Cfg.Aim.VisCheck  -- используем отдельную настройку для аима
     if Cfg.Aim.Sticky and S.tgt.part and S.tgt.plr then
         local ch = S.tgt.plr.Character
         if ch and ch.Parent and GetHP(ch) > 0 then
@@ -301,7 +349,7 @@ local function FindTarget()
                 local inF = true
                 if Cfg.Aim.FOVOn then inF = SDist(p.Position) <= Cfg.Aim.FOV * 1.5 end
                 local vis = true
-                if Cfg.Checks.Wall then vis = CanSee(p, S.me.char) end
+                if doVisCheck then vis = CanSee(p, S.me.char) end
                 if is360 then
                     on = true
                     inF = true
@@ -335,7 +383,7 @@ local function FindTarget()
             local sd = SDist(p.Position)
             if Cfg.Aim.FOVOn and not is360 and sd > Cfg.Aim.FOV then break end
             if not is360 and GetAng(p) > Cfg.Limits.MaxAngle then break end
-            if Cfg.Checks.Wall and not CanSee(p, S.me.char) then break end
+            if doVisCheck and not CanSee(p, S.me.char) then break end
             local sc = 10000 - sd
             if sc > bestScore then
                 bestScore = sc
@@ -378,6 +426,52 @@ local function ApplyAim(p)
     local amt = (1 / (1 + sm * 0.3)) * sp
     amt = math.clamp(amt, 0.001, 1)
     Cam.CFrame = Cam.CFrame:Lerp(tcf, amt)
+end
+
+-- ---- Trigger Bot ----
+local function UpdateTriggerBot()
+    if not Cfg.TriggerBot.On then return end
+    if not Exec.canClick then return end
+    if not Cfg.Aim.On then return end
+    if not S.tgt.part or not S.tgt.vis then return end
+    
+    -- check ADS if required
+    if Cfg.TriggerBot.OnlyADS then
+        local rmb = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+        if not rmb then return end
+    end
+    
+    -- check if target is actually on screen center (within small threshold)
+    local sp, on = W2S(S.tgt.part.Position)
+    if not sp or not on then return end
+    local center = ScrC()
+    local distToCenter = (sp - center).Magnitude
+    
+    -- trigger only if crosshair is close to target (within ~30px)
+    local threshold = 30
+    if distToCenter > threshold then return end
+    
+    -- check delay
+    local now = tick()
+    if now - S.trigger.lastShot < Cfg.TriggerBot.Delay then return end
+    
+    -- fire!
+    S.trigger.lastShot = now
+    local burstCount = math.clamp(Cfg.TriggerBot.BurstCount, 1, 10)
+    
+    if burstCount == 1 then
+        DoClick()
+    else
+        task.spawn(function()
+            for i = 1, burstCount do
+                if DEAD then break end
+                DoClick()
+                if i < burstCount then
+                    task.wait(Cfg.TriggerBot.BurstDelay)
+                end
+            end
+        end)
+    end
 end
 
 -- ---- Magic Bullet (hookmetamethod with newcclosure — Eclipse supported) ----
@@ -909,6 +1003,16 @@ function HUD.Create()
             S.draw.mb.Color = Color3.fromRGB(255, 80, 80)
         end)
     end
+    S.draw.tb = ND("Text")
+    if S.draw.tb then
+        pcall(function()
+            S.draw.tb.Center = false
+            S.draw.tb.Outline = true
+            S.draw.tb.Size = SC(12, 11)
+            S.draw.tb.Position = Vector2.new(10, SC(44, 74))
+            S.draw.tb.Color = Color3.fromRGB(255, 200, 50)
+        end)
+    end
 end
 
 function HUD.Update()
@@ -949,6 +1053,16 @@ function HUD.Update()
             pcall(function() d.mb.Visible = false end)
         end
     end
+    if d.tb then
+        if Cfg.TriggerBot.On then
+            pcall(function()
+                d.tb.Text = "TRIGGER BOT ON"
+                d.tb.Visible = true
+            end)
+        else
+            pcall(function() d.tb.Visible = false end)
+        end
+    end
     if Cfg.Aim.On and S.tgt.part and S.tgt.vis then
         local sp, on = W2S(S.tgt.part.Position)
         if sp and on then
@@ -985,22 +1099,115 @@ local function Cleanup()
     pcall(WH.KillAll)
     pcall(HUD.Destroy)
     if S.gui then pcall(function() S.gui:Destroy() end) end
-    if S.me.hum then pcall(function() S.me.hum.WalkSpeed = 16 end) end
+    if S.me.hum then pcall(function() S.me.hum.WalkSpeed = S.speed.originalWS or 16 end) end
+    if S.speed.bodyVel then pcall(function() S.speed.bodyVel:Destroy() end) end
     _G.XenoLoaded = false
     _G.XenoCleanup = nil
 end
 
--- ---- Movement ----
+-- ---- Movement (improved speed hack methods) ----
+local function GetMoveDirection()
+    if not S.me.hum or not S.me.root then return Vector3.zero end
+    local moveDir = S.me.hum.MoveDirection
+    if moveDir.Magnitude < 0.01 then return Vector3.zero end
+    return moveDir
+end
+
 local function ApplyMovement(dt)
     if not S.me.alive or not S.me.root then return end
+    
+    -- SpinBot
     if Cfg.Spin.On then
         S.spinAng = (S.spinAng + Cfg.Spin.Spd * dt * 60) % 360
         pcall(function()
             S.me.root.CFrame = CFrame.new(S.me.root.Position) * CFrame.Angles(0, math.rad(S.spinAng), 0)
         end)
     end
+    
+    -- Speed Hack (multiple methods)
     if Cfg.Speed.On and S.me.hum then
-        pcall(function() S.me.hum.WalkSpeed = 16 * Cfg.Speed.Mult end)
+        local mult = Cfg.Speed.Mult
+        local method = Cfg.Speed.Method
+        local moveDir = GetMoveDirection()
+        
+        if method == "CFrame" then
+            -- CFrame-based movement (less detectable)
+            -- Only apply extra speed, doesn't touch WalkSpeed
+            if moveDir.Magnitude > 0.1 then
+                local extraSpeed = (mult - 1) * S.speed.originalWS * dt
+                local offset = moveDir * extraSpeed
+                pcall(function()
+                    S.me.root.CFrame = S.me.root.CFrame + offset
+                end)
+            end
+            -- restore walkspeed to normal
+            pcall(function()
+                if S.me.hum.WalkSpeed ~= S.speed.originalWS then
+                    S.me.hum.WalkSpeed = S.speed.originalWS
+                end
+            end)
+            
+        elseif method == "Velocity" then
+            -- BodyVelocity method
+            if moveDir.Magnitude > 0.1 then
+                if not S.speed.bodyVel or not S.speed.bodyVel.Parent then
+                    pcall(function()
+                        S.speed.bodyVel = Instance.new("BodyVelocity")
+                        S.speed.bodyVel.MaxForce = Vector3.new(100000, 0, 100000)
+                        S.speed.bodyVel.P = 10000
+                        S.speed.bodyVel.Parent = S.me.root
+                    end)
+                end
+                if S.speed.bodyVel then
+                    local targetVel = moveDir * S.speed.originalWS * mult
+                    pcall(function()
+                        S.speed.bodyVel.Velocity = Vector3.new(targetVel.X, S.me.root.Velocity.Y, targetVel.Z)
+                    end)
+                end
+            else
+                -- not moving, remove body velocity
+                if S.speed.bodyVel and S.speed.bodyVel.Parent then
+                    pcall(function()
+                        S.speed.bodyVel.Velocity = Vector3.zero
+                    end)
+                end
+            end
+            -- restore walkspeed
+            pcall(function()
+                if S.me.hum.WalkSpeed ~= S.speed.originalWS then
+                    S.me.hum.WalkSpeed = S.speed.originalWS
+                end
+            end)
+            
+        elseif method == "Teleport" then
+            -- Micro-teleport method (most aggressive, can look laggy)
+            if moveDir.Magnitude > 0.1 then
+                local extraSpeed = (mult - 1) * S.speed.originalWS * dt
+                local offset = moveDir * extraSpeed
+                pcall(function()
+                    S.me.root.CFrame = S.me.root.CFrame + offset
+                end)
+            end
+            pcall(function()
+                if S.me.hum.WalkSpeed ~= S.speed.originalWS then
+                    S.me.hum.WalkSpeed = S.speed.originalWS
+                end
+            end)
+        end
+    else
+        -- Speed hack off - cleanup
+        if S.speed.bodyVel and S.speed.bodyVel.Parent then
+            pcall(function() S.speed.bodyVel:Destroy() end)
+            S.speed.bodyVel = nil
+        end
+        -- restore original walkspeed if needed
+        if S.me.hum and S.speed.originalWS then
+            pcall(function()
+                if math.abs(S.me.hum.WalkSpeed - S.speed.originalWS) > 0.1 then
+                    S.me.hum.WalkSpeed = S.speed.originalWS
+                end
+            end)
+        end
     end
 end
 
@@ -1025,7 +1232,7 @@ local function BuildGUI()
     S.gui = gui
 
     local mW = SC(460, 380)
-    local mH = SC(380, 340)
+    local mH = SC(400, 360)
     local main = Instance.new("Frame", gui)
     main.Name = "MainFrame"
     main.Size = UDim2.new(0, mW, 0, mH)
@@ -1040,7 +1247,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextLabel", main)
-    tl.Text = "XENO v17.0 [Eclipse]"
+    tl.Text = "XENO v17.1 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -1487,6 +1694,7 @@ local function BuildGUI()
     mkDD (tA, "Bone", {"Head", "UpperTorso", "HumanoidRootPart"}, Cfg.Aim, "Part")
     mkTog(tA, "Sticky Target", Cfg.Aim, "Sticky")
     mkTog(tA, "360 Aim", Cfg.Aim, "Aim360")
+    mkTog(tA, "Visible Check", Cfg.Aim, "VisCheck")  -- отдельная настройка!
     mkTog(tA, "FOV Circle", Cfg.Aim, "FOVOn")
     mkSld(tA, "FOV Radius", 10, 500, Cfg.Aim, "FOV", "%.0f")
     mkSep(tA, "SPEED / SMOOTH")
@@ -1495,9 +1703,15 @@ local function BuildGUI()
     mkSep(tA, "PREDICTION")
     mkTog(tA, "Prediction", Cfg.Aim, "Prediction")
     mkSld(tA, "Pred Factor", 0.05, 0.5, Cfg.Aim, "PredFactor", "%.2f")
+    mkSep(tA, "TRIGGER BOT")
+    mkTog(tA, "Trigger Bot", Cfg.TriggerBot, "On")
+    mkSld(tA, "Shot Delay", 0.01, 0.5, Cfg.TriggerBot, "Delay", "%.2f")
+    mkSld(tA, "Burst Count", 1, 10, Cfg.TriggerBot, "BurstCount", "%.0f")
+    mkSld(tA, "Burst Delay", 0.01, 0.1, Cfg.TriggerBot, "BurstDelay", "%.2f")
+    mkTog(tA, "Only ADS (RMB)", Cfg.TriggerBot, "OnlyADS")
     mkSep(tA, "CHECKS")
     mkTog(tA, "Team Check", Cfg.Checks, "Team")
-    mkTog(tA, "Wall Check", Cfg.Checks, "Wall")
+    mkTog(tA, "Wall Check (ESP/WH)", Cfg.Checks, "Wall")
 
     -- ESP TAB
     ord = 0
@@ -1542,6 +1756,7 @@ local function BuildGUI()
     mkTog(tM, "SpinBot", Cfg.Spin, "On")
     mkSld(tM, "Spin Speed", 1, 50, Cfg.Spin, "Spd", "%.0f")
     mkTog(tM, "Speed Boost", Cfg.Speed, "On")
+    mkDD (tM, "Speed Method", {"CFrame", "Velocity", "Teleport"}, Cfg.Speed, "Method")
     mkSld(tM, "Speed Mult", 1, 3, Cfg.Speed, "Mult", "%.2f")
     mkSep(tM, "LIMITS")
     mkSld(tM, "Max Distance", 100, 3000, Cfg.Limits, "MaxDist", "%.0f")
@@ -1551,7 +1766,9 @@ local function BuildGUI()
     local il = Instance.new("TextLabel", tM)
     local silentStr = "N"
     if Exec.canSilent then silentStr = "Y" end
-    il.Text = Exec.name .. " | Silent: " .. silentStr
+    local clickStr = "N"
+    if Exec.canClick then clickStr = "Y" end
+    il.Text = Exec.name .. " | Silent: " .. silentStr .. " | Click: " .. clickStr
     il.Size = UDim2.new(1, 0, 0, 18)
     il.BackgroundTransparency = 1
     il.TextColor3 = TXTD
@@ -1893,6 +2110,8 @@ local function MainLoop()
                 S.tgt.vis = false
             end
         end
+        -- Trigger Bot
+        UpdateTriggerBot()
         if Cfg.TP.On and S.me.alive and S.me.root and S.tgt.part then TPFix() end
         ApplyMovement(dt)
         E.UpdateBatch()
@@ -1930,4 +2149,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.0", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v17.1", "Loaded [Eclipse]. Tap X button to open menu.", 5)
