@@ -167,7 +167,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v17.3 [Eclipse]...", 3)
+Notify("XENO", "Loading v17.4 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -502,6 +502,26 @@ end
 
 local function ApplyAim(p)
     if not p or not Cam then return end
+    
+    -- Silent mode: don't move camera visually, hooks handle it
+    if Cfg.Aim.Mode == "Silent" then
+        -- just make sure hooks are installed
+        if not S.magic.hookInstalled then
+            InstallSilentHooks()
+        end
+        return
+    end
+    
+    -- Minimal mode: snap instantly
+    if Cfg.Aim.Mode == "Minimal" then
+        local tcf = MakeCF(p)
+        if tcf then
+            Cam.CFrame = tcf
+        end
+        return
+    end
+    
+    -- Normal mode: smooth aim
     local tcf = MakeCF(p)
     if not tcf then return end
     local sm = math.clamp(Cfg.Aim.Smooth, 0, 100)
@@ -572,72 +592,239 @@ local function UpdateTriggerBot()
     end
 end
 
--- ---- Magic Bullet (hookmetamethod with newcclosure — Eclipse supported) ----
-local function FindNearestHead()
-    if not S.me.alive or not S.me.root then return nil end
-    local best, bestD = nil, Cfg.MagicBullet.Range
+-- ---- Silent Aim / Magic Bullet System ----
+-- Silent Aim = подменяет камеру для игры, но визуально ты смотришь в другую сторону
+-- Magic Bullet = перенаправляет Raycast/FindPartOnRay на голову врага
+
+local function FindBestTarget()
+    if not S.me.alive or not S.me.root then return nil, nil end
+    local best, bestD, bestPart = nil, Cfg.MagicBullet.Range, nil
+    
     for _, tp in ipairs(S.plList) do
         repeat
             if tp == Plr then break end
             local ch = tp.Character
             if not ch or not ch.Parent then break end
             if Cfg.Checks.Team and TeamEq(Plr, tp) then break end
-            local h = ch:FindFirstChild("Head")
-            if not h then break end
             if GetHP(ch) <= 0 then break end
-            local d = (h.Position - S.me.root.Position).Magnitude
+            
+            -- get target bone based on aim settings
+            local targetPart = ch:FindFirstChild(Cfg.Aim.Part) or ch:FindFirstChild("Head")
+            if not targetPart then break end
+            
+            local d = (targetPart.Position - S.me.root.Position).Magnitude
             if d < bestD then
-                if not Cfg.Checks.Wall or CanSee(h, S.me.char) then
-                    best = h
+                if not Cfg.Checks.Wall or CanSee(targetPart, S.me.char) then
+                    best = tp
                     bestD = d
+                    bestPart = targetPart
                 end
             end
         until true
     end
-    return best, bestD
+    return bestPart, best
 end
 
-local function InstallMagicBullet()
+local function GetSilentAimTarget()
+    -- для silent aim используем текущую цель аимбота или ищем новую
+    if S.tgt.part and S.tgt.plr and S.tgt.vis then
+        local ch = S.tgt.plr.Character
+        if ch and ch.Parent and GetHP(ch) > 0 then
+            return S.tgt.part
+        end
+    end
+    local part, _ = FindBestTarget()
+    return part
+end
+
+local function InstallSilentHooks()
     if S.magic.hookInstalled then return end
     if not Exec.canSilent then
-        Notify("MAGIC BULLET", "hookmetamethod not supported", 3)
+        Notify("SILENT/MAGIC", "hookmetamethod not supported", 3)
         return
     end
+    
     S.magic.hookInstalled = true
     local wrap = newcclosure or function(f) return f end
+    
+    -- Hook __namecall for Raycast, FindPartOnRay, etc
     pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            if DEAD or not S.magic.on then return oldNc(self, ...) end
-            local m = getnamecallmethod()
-            if self == WS and m == "Raycast" then
-                local args = {...}
-                if #args >= 2 and typeof(args[1]) == "Vector3" then
-                    local head = FindNearestHead()
-                    if head then
+            if DEAD then return oldNc(self, ...) end
+            
+            local method = getnamecallmethod()
+            local args = {...}
+            
+            -- Magic Bullet: redirect raycast direction
+            if S.magic.on and self == WS then
+                -- Workspace:Raycast(origin, direction, params)
+                if method == "Raycast" and #args >= 2 then
+                    if typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
                         local origin = args[1]
-                        if (origin - S.me.root.Position).Magnitude < 50 then
-                            local dir = (head.Position - origin)
-                            if dir.Magnitude > 0.001 then
-                                S.magic.target = head
-                                local newDir = dir.Unit * 1000
-                                return oldNc(self, origin, newDir, select(3, ...))
+                        -- check if raycast is from player (near camera/root)
+                        local fromPlayer = false
+                        if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then
+                            fromPlayer = true
+                        end
+                        if Cam and (origin - Cam.CFrame.Position).Magnitude < 10 then
+                            fromPlayer = true
+                        end
+                        
+                        if fromPlayer then
+                            local targetPart, _ = FindBestTarget()
+                            if targetPart then
+                                local newDir = (targetPart.Position - origin)
+                                if newDir.Magnitude > 0.001 then
+                                    S.magic.target = targetPart
+                                    newDir = newDir.Unit * args[2].Magnitude
+                                    return oldNc(self, origin, newDir, select(3, ...))
+                                end
+                            end
+                        end
+                    end
+                end
+                
+                -- Workspace:FindPartOnRay(ray, ignoreList, ...)
+                if method == "FindPartOnRay" and #args >= 1 then
+                    if typeof(args[1]) == "Ray" then
+                        local ray = args[1]
+                        local origin = ray.Origin
+                        local fromPlayer = false
+                        if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then
+                            fromPlayer = true
+                        end
+                        if Cam and (origin - Cam.CFrame.Position).Magnitude < 10 then
+                            fromPlayer = true
+                        end
+                        
+                        if fromPlayer then
+                            local targetPart, _ = FindBestTarget()
+                            if targetPart then
+                                local newDir = (targetPart.Position - origin)
+                                if newDir.Magnitude > 0.001 then
+                                    S.magic.target = targetPart
+                                    local newRay = Ray.new(origin, newDir.Unit * ray.Direction.Magnitude)
+                                    return oldNc(self, newRay, select(2, ...))
+                                end
+                            end
+                        end
+                    end
+                end
+                
+                -- Workspace:FindPartOnRayWithIgnoreList(ray, ignoreList, ...)
+                if method == "FindPartOnRayWithIgnoreList" and #args >= 1 then
+                    if typeof(args[1]) == "Ray" then
+                        local ray = args[1]
+                        local origin = ray.Origin
+                        local fromPlayer = false
+                        if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then
+                            fromPlayer = true
+                        end
+                        if Cam and (origin - Cam.CFrame.Position).Magnitude < 10 then
+                            fromPlayer = true
+                        end
+                        
+                        if fromPlayer then
+                            local targetPart, _ = FindBestTarget()
+                            if targetPart then
+                                local newDir = (targetPart.Position - origin)
+                                if newDir.Magnitude > 0.001 then
+                                    S.magic.target = targetPart
+                                    local newRay = Ray.new(origin, newDir.Unit * ray.Direction.Magnitude)
+                                    return oldNc(self, newRay, select(2, ...))
+                                end
+                            end
+                        end
+                    end
+                end
+                
+                -- Workspace:FindPartOnRayWithWhitelist(ray, whitelist, ...)
+                if method == "FindPartOnRayWithWhitelist" and #args >= 1 then
+                    if typeof(args[1]) == "Ray" then
+                        local ray = args[1]
+                        local origin = ray.Origin
+                        local fromPlayer = false
+                        if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then
+                            fromPlayer = true
+                        end
+                        if Cam and (origin - Cam.CFrame.Position).Magnitude < 10 then
+                            fromPlayer = true
+                        end
+                        
+                        if fromPlayer then
+                            local targetPart, _ = FindBestTarget()
+                            if targetPart then
+                                local newDir = (targetPart.Position - origin)
+                                if newDir.Magnitude > 0.001 then
+                                    S.magic.target = targetPart
+                                    local newRay = Ray.new(origin, newDir.Unit * ray.Direction.Magnitude)
+                                    return oldNc(self, newRay, select(2, ...))
+                                end
                             end
                         end
                     end
                 end
             end
+            
+            -- Silent Aim: intercept camera lookups and return fake CFrame
+            if Cfg.Aim.On and Cfg.Aim.Mode == "Silent" then
+                -- Camera:GetRenderCFrame(), CurrentCamera.CFrame, etc
+                if self == Cam or (typeof(self) == "Instance" and self:IsA("Camera")) then
+                    if method == "GetRenderCFrame" or method == "GetCFrame" then
+                        local targetPart = GetSilentAimTarget()
+                        if targetPart then
+                            local camPos = Cam.CFrame.Position
+                            local fakeCF = CFrame.lookAt(camPos, targetPart.Position)
+                            return fakeCF
+                        end
+                    end
+                end
+            end
+            
             return oldNc(self, ...)
         end))
     end)
-    Notify("MAGIC BULLET", "Hook installed", 2)
+    
+    -- Hook __index for Camera.CFrame reads (Silent Aim)
+    pcall(function()
+        local oldIdx
+        oldIdx = hookmetamethod(game, "__index", wrap(function(self, key)
+            if DEAD then return oldIdx(self, key) end
+            
+            -- Silent Aim: fake camera CFrame
+            if Cfg.Aim.On and Cfg.Aim.Mode == "Silent" then
+                if (self == Cam or (typeof(self) == "Instance" and self:IsA("Camera"))) then
+                    if key == "CFrame" or key == "CoordinateFrame" then
+                        local targetPart = GetSilentAimTarget()
+                        if targetPart then
+                            local realCF = oldIdx(self, key)
+                            local fakeCF = CFrame.lookAt(realCF.Position, targetPart.Position)
+                            return fakeCF
+                        end
+                    end
+                end
+            end
+            
+            return oldIdx(self, key)
+        end))
+    end)
+    
+    Notify("SILENT/MAGIC", "Hooks installed", 2)
 end
 
 local function ToggleMagicBullet()
     S.magic.on = not S.magic.on
     Cfg.MagicBullet.On = S.magic.on
-    if S.magic.on and not S.magic.hookInstalled then InstallMagicBullet() end
+    if S.magic.on and not S.magic.hookInstalled then InstallSilentHooks() end
     if not S.magic.on then S.magic.target = nil end
+end
+
+-- Install hooks when Silent mode is selected
+local function OnAimModeChanged(mode)
+    if mode == "Silent" and not S.magic.hookInstalled then
+        InstallSilentHooks()
+    end
 end
 
 -- ---- 3rd Person Fix ----
@@ -1072,8 +1259,11 @@ function HUD.Create()
     if not drawOK then return end
     S.draw.fov = ND("Circle")
     if S.draw.fov then
-        pcall(function() S.draw.fov.Filled = false
-        S.draw.fov.NumSides = 40 end)
+        pcall(function() 
+            S.draw.fov.Filled = false
+            S.draw.fov.NumSides = 60
+            S.draw.fov.Thickness = 1
+        end)
     end
     S.draw.line = ND("Line")
     S.draw.dot = ND("Circle")
@@ -1122,8 +1312,9 @@ function HUD.Update()
             d.fov.Position = c
             d.fov.Radius = Cfg.Aim.FOV
             d.fov.Color = Cfg.UI.Accent
-            d.fov.Transparency = 0.7
-            d.fov.Thickness = 1.5
+            d.fov.Filled = false
+            d.fov.Transparency = 0.3
+            d.fov.Thickness = 1
             d.fov.Visible = Cfg.Aim.On and Cfg.Aim.FOVOn
         end)
     end
@@ -1379,7 +1570,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextLabel", main)
-    tl.Text = "XENO v17.3 [Eclipse]"
+    tl.Text = "XENO v17.4 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -1822,7 +2013,9 @@ local function BuildGUI()
     ord = 0
     mkSep(tA, "AIMBOT")
     mkTog(tA, "Enabled", Cfg.Aim, "On")
-    mkDD (tA, "Mode", {"Minimal", "Normal", "Silent"}, Cfg.Aim, "Mode")
+    mkDD (tA, "Mode", {"Minimal", "Normal", "Silent"}, Cfg.Aim, "Mode", function(v)
+        OnAimModeChanged(v)
+    end)
     mkDD (tA, "Bone", {"Head", "UpperTorso", "HumanoidRootPart"}, Cfg.Aim, "Part")
     mkTog(tA, "Sticky Target", Cfg.Aim, "Sticky")
     mkTog(tA, "360 Aim", Cfg.Aim, "Aim360")
@@ -2281,4 +2474,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.3", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v17.4", "Loaded [Eclipse]. Tap X button to open menu.", 5)
