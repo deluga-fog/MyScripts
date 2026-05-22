@@ -101,7 +101,7 @@ local function DoClick()
     end)
 end
 
-Notify("XENO", "Loading v17.1 [Eclipse]...", 3)
+Notify("XENO", "Loading v17.2 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -277,6 +277,8 @@ local function SetupChar()
             pcall(function() S.speed.bodyVel:Destroy() end)
             S.speed.bodyVel = nil
         end
+        -- reset speed state
+        S.speed.originalWS = 16
         local hum, root
         pcall(function() hum  = ch:WaitForChild("Humanoid", 10) end)
         pcall(function() root = ch:WaitForChild("HumanoidRootPart", 10) end)
@@ -284,16 +286,31 @@ local function SetupChar()
         S.me.hum  = hum
         S.me.root = root
         S.me.alive = true
-        S.speed.originalWS = hum.WalkSpeed
+        -- wait a bit for game to set proper WalkSpeed, then save it
+        task.spawn(function()
+            task.wait(0.5)
+            if hum and hum.Parent and not DEAD then
+                local ws = hum.WalkSpeed
+                -- make sure we got a valid walkspeed (not 0, not too low)
+                if ws >= 1 then
+                    S.speed.originalWS = ws
+                else
+                    S.speed.originalWS = 16
+                end
+            end
+        end)
         hum.Died:Connect(function()
             S.me.alive = false
             S.tgt.part = nil
             S.tgt.plr = nil
             S.tpRot = 0
+            -- cleanup body velocity on death
             if S.speed.bodyVel then
                 pcall(function() S.speed.bodyVel:Destroy() end)
                 S.speed.bodyVel = nil
             end
+            -- disable speed hack on death to prevent issues
+            -- (user can re-enable after respawn)
         end)
     end
     if Plr.Character then task.spawn(onChar, Plr.Character) end
@@ -1099,8 +1116,18 @@ local function Cleanup()
     pcall(WH.KillAll)
     pcall(HUD.Destroy)
     if S.gui then pcall(function() S.gui:Destroy() end) end
-    if S.me.hum then pcall(function() S.me.hum.WalkSpeed = S.speed.originalWS or 16 end) end
-    if S.speed.bodyVel then pcall(function() S.speed.bodyVel:Destroy() end) end
+    -- cleanup speed hack
+    if S.speed.bodyVel then 
+        pcall(function() S.speed.bodyVel:Destroy() end) 
+        S.speed.bodyVel = nil
+    end
+    if S.me.hum and S.me.hum.Parent then 
+        pcall(function() 
+            local ws = S.speed.originalWS
+            if not ws or ws < 1 then ws = 16 end
+            S.me.hum.WalkSpeed = ws 
+        end) 
+    end
     _G.XenoLoaded = false
     _G.XenoCleanup = nil
 end
@@ -1113,8 +1140,33 @@ local function GetMoveDirection()
     return moveDir
 end
 
+local function CleanupSpeedHack()
+    -- remove body velocity if exists
+    if S.speed.bodyVel then
+        pcall(function() S.speed.bodyVel:Destroy() end)
+        S.speed.bodyVel = nil
+    end
+    -- restore walkspeed
+    if S.me.hum and S.me.hum.Parent then
+        pcall(function()
+            if S.speed.originalWS and S.speed.originalWS >= 1 then
+                S.me.hum.WalkSpeed = S.speed.originalWS
+            else
+                S.me.hum.WalkSpeed = 16
+            end
+        end)
+    end
+end
+
 local function ApplyMovement(dt)
-    if not S.me.alive or not S.me.root then return end
+    if not S.me.alive or not S.me.root or not S.me.root.Parent then 
+        CleanupSpeedHack()
+        return 
+    end
+    if not S.me.hum or not S.me.hum.Parent then
+        CleanupSpeedHack()
+        return
+    end
     
     -- SpinBot
     if Cfg.Spin.On then
@@ -1124,90 +1176,80 @@ local function ApplyMovement(dt)
         end)
     end
     
+    -- ensure originalWS is valid
+    if not S.speed.originalWS or S.speed.originalWS < 1 then
+        S.speed.originalWS = 16
+    end
+    
     -- Speed Hack (multiple methods)
-    if Cfg.Speed.On and S.me.hum then
+    if Cfg.Speed.On then
         local mult = Cfg.Speed.Mult
         local method = Cfg.Speed.Method
         local moveDir = GetMoveDirection()
+        local baseSpeed = S.speed.originalWS
         
         if method == "CFrame" then
             -- CFrame-based movement (less detectable)
             -- Only apply extra speed, doesn't touch WalkSpeed
             if moveDir.Magnitude > 0.1 then
-                local extraSpeed = (mult - 1) * S.speed.originalWS * dt
+                local extraSpeed = (mult - 1) * baseSpeed * dt
                 local offset = moveDir * extraSpeed
                 pcall(function()
                     S.me.root.CFrame = S.me.root.CFrame + offset
                 end)
             end
-            -- restore walkspeed to normal
-            pcall(function()
-                if S.me.hum.WalkSpeed ~= S.speed.originalWS then
-                    S.me.hum.WalkSpeed = S.speed.originalWS
-                end
-            end)
+            -- cleanup any leftover body velocity
+            if S.speed.bodyVel and S.speed.bodyVel.Parent then
+                pcall(function() S.speed.bodyVel:Destroy() end)
+                S.speed.bodyVel = nil
+            end
             
         elseif method == "Velocity" then
             -- BodyVelocity method
             if moveDir.Magnitude > 0.1 then
                 if not S.speed.bodyVel or not S.speed.bodyVel.Parent then
                     pcall(function()
+                        -- remove old one first
+                        if S.speed.bodyVel then S.speed.bodyVel:Destroy() end
                         S.speed.bodyVel = Instance.new("BodyVelocity")
                         S.speed.bodyVel.MaxForce = Vector3.new(100000, 0, 100000)
                         S.speed.bodyVel.P = 10000
                         S.speed.bodyVel.Parent = S.me.root
                     end)
                 end
-                if S.speed.bodyVel then
-                    local targetVel = moveDir * S.speed.originalWS * mult
+                if S.speed.bodyVel and S.speed.bodyVel.Parent then
+                    local targetVel = moveDir * baseSpeed * mult
                     pcall(function()
                         S.speed.bodyVel.Velocity = Vector3.new(targetVel.X, S.me.root.Velocity.Y, targetVel.Z)
                     end)
                 end
             else
-                -- not moving, remove body velocity
+                -- not moving, zero out velocity but keep object
                 if S.speed.bodyVel and S.speed.bodyVel.Parent then
                     pcall(function()
                         S.speed.bodyVel.Velocity = Vector3.zero
                     end)
                 end
             end
-            -- restore walkspeed
-            pcall(function()
-                if S.me.hum.WalkSpeed ~= S.speed.originalWS then
-                    S.me.hum.WalkSpeed = S.speed.originalWS
-                end
-            end)
             
         elseif method == "Teleport" then
             -- Micro-teleport method (most aggressive, can look laggy)
             if moveDir.Magnitude > 0.1 then
-                local extraSpeed = (mult - 1) * S.speed.originalWS * dt
+                local extraSpeed = (mult - 1) * baseSpeed * dt
                 local offset = moveDir * extraSpeed
                 pcall(function()
                     S.me.root.CFrame = S.me.root.CFrame + offset
                 end)
             end
-            pcall(function()
-                if S.me.hum.WalkSpeed ~= S.speed.originalWS then
-                    S.me.hum.WalkSpeed = S.speed.originalWS
-                end
-            end)
+            -- cleanup any leftover body velocity
+            if S.speed.bodyVel and S.speed.bodyVel.Parent then
+                pcall(function() S.speed.bodyVel:Destroy() end)
+                S.speed.bodyVel = nil
+            end
         end
     else
         -- Speed hack off - cleanup
-        if S.speed.bodyVel and S.speed.bodyVel.Parent then
-            pcall(function() S.speed.bodyVel:Destroy() end)
-            S.speed.bodyVel = nil
-        end
-        -- restore original walkspeed if needed
-        if S.me.hum and S.speed.originalWS then
-            pcall(function()
-                if math.abs(S.me.hum.WalkSpeed - S.speed.originalWS) > 0.1 then
-                    S.me.hum.WalkSpeed = S.speed.originalWS
-                end
-            end)
-        end
+        CleanupSpeedHack()
     end
 end
 
@@ -1247,7 +1289,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextLabel", main)
-    tl.Text = "XENO v17.1 [Eclipse]"
+    tl.Text = "XENO v17.2 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2149,4 +2191,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.1", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v17.2", "Loaded [Eclipse]. Tap X button to open menu.", 5)
