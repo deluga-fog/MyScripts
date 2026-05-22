@@ -1,1426 +1,2008 @@
--- Eclipse byte-limit detector
--- Each checkpoint fires after ~10 KB of code parsed.
--- Last "CP NNkb" notification you see = approx where Eclipse stopped.
--- If you see "DONE 100kb" - no byte limit.
+-- =====================================================================
+-- XENO v17.0 - Clean Rewrite
+-- Engine: v10.1 (Drawing API, batching, reusable objects = NO FPS DROPS)
+-- UI:     v16.1 (7 tabs, RGB picker, PERF tab, smoothness fixed)
+-- Parser: works on Eclipse (no continue, no table.clear, no unicode,
+--                          no inline ;, no multiline if, no big pcall wrapper)
+-- =====================================================================
 
-local function n(t, m)
+-- ---- Cleanup previous load ----
+if _G.XenoLoaded and _G.XenoCleanup then _G.XenoCleanup() end
+_G.XenoLoaded = true
+
+-- ---- Services ----
+local Players    = game:GetService("Players")
+local UIS        = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local WS         = game:GetService("Workspace")
+local StarterGui = game:GetService("StarterGui")
+local CoreGui    = game:GetService("CoreGui")
+
+local Plr   = Players.LocalPlayer
+local Cam   = WS.CurrentCamera
+local Mouse = Plr:GetMouse()
+local IsMobile = UIS.TouchEnabled and not UIS.KeyboardEnabled
+local function SC(p, m) if IsMobile then return m end return p end
+
+-- ---- Executor probe ----
+local Exec = {name = "Unknown", canSilent = false, canCoreGui = false}
+pcall(function()
+    if identifyexecutor then Exec.name = identifyexecutor() end
+end)
+pcall(function()
+    local t = Instance.new("Folder")
+    t.Parent = CoreGui
+    t:Destroy()
+    Exec.canCoreGui = true
+end)
+Exec.canSilent = typeof(hookmetamethod) == "function"
+
+local drawOK = false
+pcall(function()
+    local t = Drawing.new("Line")
+    t.Visible = false
+    t:Remove()
+    drawOK = true
+end)
+
+local DEAD = false
+
+-- ---- Helpers ----
+local function Notify(title, msg, dur)
     pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification",
-            {Title = t, Text = m or "", Duration = 5})
+        StarterGui:SetCore("SendNotification", {Title = title, Text = msg or "", Duration = dur or 4})
     end)
 end
 
-n("CP", "START 0kb", 4)
+local function SafeP()
+    if Exec.canCoreGui then return CoreGui end
+    if typeof(gethui) == "function" then
+        local o, r = pcall(gethui)
+        if o and r then return r end
+    end
+    return Plr:WaitForChild("PlayerGui")
+end
+
+local function Protect(g)
+    if typeof(syn) == "table" and syn.protect_gui then pcall(syn.protect_gui, g) end
+    if typeof(protect_gui) == "function" then pcall(protect_gui, g) end
+end
+
+local function ND(t)
+    if not drawOK then return nil end
+    local s, d = pcall(Drawing.new, t)
+    if not s or not d then return nil end
+    pcall(function() d.Visible = false end)
+    return d
+end
+
+local function Kill(d)
+    if not d then return end
+    pcall(function() d.Visible = false end)
+    pcall(function() d:Remove() end)
+    pcall(function() d:Destroy() end)
+end
+
+Notify("XENO", "Loading v17.0...", 3)
+
+-- ---- Config ----
+local Cfg = {
+    Aim = {
+        On = false,
+        Mode = "Normal",
+        Part = "Head",
+        FOV = 120,
+        FOVOn = true,
+        Smooth = 30,
+        Speed = 1.0,
+        Prediction = false,
+        PredFactor = 0.12,
+        Sticky = false,
+        Aim360 = false,
+    },
+    ESP = {
+        On = false,
+        MaxDist = 1500,
+        ShowTeam = false,
+    },
+    Box = {On = true, Style = "Corner", Thickness = 1, Outline = true, Color = Color3.fromRGB(255, 50, 50), TeamColor = Color3.fromRGB(50, 255, 50)},
+    Name = {On = true, Size = 13, Format = "Name+Dist", Color = Color3.fromRGB(255, 255, 255), TeamColor = Color3.fromRGB(255, 255, 255)},
+    HP = {On = true, Width = 3, Offset = 5, BgColor = Color3.fromRGB(25, 25, 25)},
+    Tracer = {On = false, Thickness = 1.5, Color = Color3.fromRGB(255, 80, 80)},
+    HeadDot = {On = false, Radius = 4, Color = Color3.fromRGB(255, 255, 255)},
+    WH = {
+        On = false,
+        ShowTeam = false,
+        FT = 0.5,
+        EnemyFill = Color3.fromRGB(255, 0, 0),
+        EnemyLine = Color3.fromRGB(255, 255, 255),
+        TeamFill = Color3.fromRGB(0, 255, 0),
+        TeamLine = Color3.fromRGB(255, 255, 255),
+    },
+    TP = {On = false, RotSpeed = 0.3, MaxAngle = 45},
+    Spin = {On = false, Spd = 10},
+    Speed = {On = false, Mult = 1.5},
+    Checks = {Team = true, Wall = true},
+    Limits = {MaxDist = 800, MaxAngle = 90, MinDist = 5},
+    MagicBullet = {On = false, Range = 300, Keybind = "E"},
+    Tick = {ESP = 3, WH = 5, HUD = 2, Aim = 1},
+    UI = {
+        Accent     = Color3.fromRGB(90, 130, 255),
+        Background = Color3.fromRGB(20, 20, 28),
+        Panel      = Color3.fromRGB(30, 30, 38),
+        Text       = Color3.fromRGB(220, 220, 230),
+        TextDim    = Color3.fromRGB(140, 140, 155),
+        Toggle     = Color3.fromRGB(50, 50, 55),
+        ButtonOK   = Color3.fromRGB(90, 130, 255),
+        ButtonBad  = Color3.fromRGB(200, 50, 50),
+    },
+}
+
+-- ---- State ----
+local S = {
+    tgt = {part = nil, plr = nil, dist = 0, hp = 0, mhp = 0, name = "", vis = false, lastT = 0, lastPos = nil, vel = Vector3.zero},
+    me  = {char = nil, hum = nil, root = nil, alive = false},
+    magic = {on = false, target = nil, hookInstalled = false},
+    esp  = {},
+    wh   = {},
+    draw = {},
+    conns = {},
+    theme = {accent = {}, bg = {}, panel = {}, text = {}, textDim = {}, btnBad = {}},
+    gui = nil,
+    frame = 0,
+    espBatch = 0,
+    plList = {},
+    plTick = 0,
+    tpRot = 0,
+    spinAng = 0,
+    fpsAvg = 60,
+    fpsLast = tick(),
+}
+
+-- ---- Geometry helpers ----
+local function W2S(pos)
+    if not Cam then Cam = WS.CurrentCamera end
+    if not Cam then return nil, false end
+    local ok, vp = pcall(function() return Cam:WorldToViewportPoint(pos) end)
+    if not ok or not vp or vp.Z <= 0 then return nil, false end
+    return Vector2.new(vp.X, vp.Y), true
+end
+
+local function ScrC()
+    if not Cam then return Vector2.new(960, 540) end
+    return Vector2.new(Cam.ViewportSize.X / 2, Cam.ViewportSize.Y / 2)
+end
+
+local function SDist(wp)
+    local sp, on = W2S(wp)
+    if not sp or not on then return 9999 end
+    return (sp - ScrC()).Magnitude
+end
+
+local function HPCol(pct)
+    pct = math.clamp(pct, 0, 1)
+    if pct > 0.6 then return Color3.new(0.2, 0.8, 0.2) end
+    if pct > 0.3 then return Color3.new(1, 0.8, 0) end
+    return Color3.new(1, 0.1, 0.1)
+end
+
+local function TeamEq(a, b)
+    if not a or not b then return false end
+    local ok1, t1 = pcall(function() return a.Team end)
+    local ok2, t2 = pcall(function() return b.Team end)
+    return ok1 and ok2 and t1 and t2 and t1 == t2
+end
+
+local function GetHP(ch)
+    if not ch then return 0, 100 end
+    local h = ch:FindFirstChildOfClass("Humanoid")
+    if not h then return 0, 100 end
+    return h.Health, h.MaxHealth
+end
+
+local function GetRoot(ch)
+    if not ch then return nil end
+    return ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("Torso") or ch.PrimaryPart
+end
+
+local function CanSee(part, myCh)
+    if not part or not myCh or not Cam then return true end
+    local ok, res = pcall(function()
+        local origin = Cam.CFrame.Position
+        local dir = part.Position - origin
+        local dist = dir.Magnitude
+        if dist < 3 then return true end
+        local par = RaycastParams.new()
+        par.FilterType = Enum.RaycastFilterType.Exclude
+        local tCh = part.Parent
+        if tCh then par.FilterDescendantsInstances = {myCh, tCh}
+        else par.FilterDescendantsInstances = {myCh} end
+        par.RespectCanCollide = false
+        local r = WS:Raycast(origin, dir.Unit * (dist - 1), par)
+        if not r then return true end
+        return r.Instance.Transparency >= 0.5 or not r.Instance.CanCollide
+    end)
+    if ok then return res end
+    return true
+end
+
+local function tclear(t)
+    for k in pairs(t) do t[k] = nil end
+end
+
+-- ---- Char setup ----
+local function SetupChar()
+    local function onChar(ch)
+        if DEAD then return end
+        S.me.char = ch
+        S.me.alive = false
+        S.tgt.part = nil
+        S.tgt.plr = nil
+        S.tpRot = 0
+        local hum, root
+        pcall(function() hum  = ch:WaitForChild("Humanoid", 10) end)
+        pcall(function() root = ch:WaitForChild("HumanoidRootPart", 10) end)
+        if not hum or not root then return end
+        S.me.hum  = hum
+        S.me.root = root
+        S.me.alive = true
+        hum.Died:Connect(function()
+            S.me.alive = false
+            S.tgt.part = nil
+            S.tgt.plr = nil
+            S.tpRot = 0
+        end)
+    end
+    if Plr.Character then task.spawn(onChar, Plr.Character) end
+    table.insert(S.conns, Plr.CharacterAdded:Connect(onChar))
+end
+
+local function GetBone(ch)
+    if not ch then return nil end
+    return ch:FindFirstChild(Cfg.Aim.Part) or ch:FindFirstChild("Head") or GetRoot(ch)
+end
+
+local function IsValid(ch, tp)
+    if not ch or not ch.Parent then return false end
+    local rp = GetRoot(ch)
+    if not rp then return false end
+    if GetHP(ch) <= 0 then return false end
+    if tp and Cfg.Checks.Team and TeamEq(Plr, tp) then return false end
+    if S.me.root then
+        local d = (rp.Position - S.me.root.Position).Magnitude
+        if d > Cfg.Limits.MaxDist then return false end
+        if d < Cfg.Limits.MinDist then return false end
+    end
+    return true
+end
+
+local function GetAng(p)
+    if not p or not Cam then return 180 end
+    local dir = p.Position - Cam.CFrame.Position
+    if dir.Magnitude < 0.001 then return 0 end
+    local dot = Cam.CFrame.LookVector:Dot(dir.Unit)
+    return math.deg(math.acos(math.clamp(dot, -1, 1)))
+end
+
+-- ---- Player list cache (refresh every 0.5s) ----
+local function RefreshPL()
+    if tick() - S.plTick < 0.5 then return end
+    S.plTick = tick()
+    S.plList = Players:GetPlayers()
+end
+
+-- ---- Find Target ----
+local function FindTarget()
+    if not S.me.alive then return nil, nil end
+    if not Cam then return nil, nil end
+    local is360 = Cfg.Aim.Aim360
+    if Cfg.Aim.Sticky and S.tgt.part and S.tgt.plr then
+        local ch = S.tgt.plr.Character
+        if ch and ch.Parent and GetHP(ch) > 0 then
+            local p = GetBone(ch)
+            if p then
+                local _, on = W2S(p.Position)
+                local inF = true
+                if Cfg.Aim.FOVOn then inF = SDist(p.Position) <= Cfg.Aim.FOV * 1.5 end
+                local vis = true
+                if Cfg.Checks.Wall then vis = CanSee(p, S.me.char) end
+                if is360 then
+                    on = true
+                    inF = true
+                end
+                if on and inF and vis then
+                    S.tgt.part = p
+                    S.tgt.lastT = tick()
+                    S.tgt.vis = true
+                    return p, S.tgt.plr
+                end
+                if tick() - (S.tgt.lastT or 0) > 3 then
+                    S.tgt.part = nil
+                    S.tgt.plr = nil
+                end
+            end
+        else
+            S.tgt.part = nil
+            S.tgt.plr = nil
+        end
+    end
+    local bestP, bestPl, bestScore = nil, nil, -9999
+    for _, tp in ipairs(S.plList) do
+        repeat
+            if tp == Plr then break end
+            local ch = tp.Character
+            if not IsValid(ch, tp) then break end
+            local p = GetBone(ch)
+            if not p then break end
+            local _, on = W2S(p.Position)
+            if not is360 and not on then break end
+            local sd = SDist(p.Position)
+            if Cfg.Aim.FOVOn and not is360 and sd > Cfg.Aim.FOV then break end
+            if not is360 and GetAng(p) > Cfg.Limits.MaxAngle then break end
+            if Cfg.Checks.Wall and not CanSee(p, S.me.char) then break end
+            local sc = 10000 - sd
+            if sc > bestScore then
+                bestScore = sc
+                bestP = p
+                bestPl = tp
+            end
+        until true
+    end
+    if bestP then S.tgt.vis = true end
+    return bestP, bestPl
+end
+
+local function PredPos(p)
+    if not p then return Vector3.zero end
+    if not Cfg.Aim.Prediction then return p.Position end
+    local cur = p.Position
+    if S.tgt.lastPos then
+        local dv = (cur - S.tgt.lastPos) * 60 - S.tgt.vel
+        S.tgt.vel = S.tgt.vel + dv * Cfg.Aim.PredFactor
+    end
+    S.tgt.lastPos = cur
+    return cur + S.tgt.vel * Cfg.Aim.PredFactor
+end
+
+local function MakeCF(p)
+    if not p or not Cam then return nil end
+    local t = PredPos(p)
+    local c = Cam.CFrame.Position
+    local d = t - c
+    if d.Magnitude < 0.001 then return nil end
+    return CFrame.lookAt(c, c + d.Unit)
+end
+
+local function ApplyAim(p)
+    if not p or not Cam then return end
+    local tcf = MakeCF(p)
+    if not tcf then return end
+    local sm = math.clamp(Cfg.Aim.Smooth, 0, 100)
+    local sp = math.clamp(Cfg.Aim.Speed, 0.01, 5)
+    local amt = (1 / (1 + sm * 0.3)) * sp
+    amt = math.clamp(amt, 0.001, 1)
+    Cam.CFrame = Cam.CFrame:Lerp(tcf, amt)
+end
+
+-- ---- Magic Bullet (hookmetamethod with newcclosure if available) ----
+local function FindNearestHead()
+    if not S.me.alive or not S.me.root then return nil end
+    local best, bestD = nil, Cfg.MagicBullet.Range
+    for _, tp in ipairs(S.plList) do
+        repeat
+            if tp == Plr then break end
+            local ch = tp.Character
+            if not ch or not ch.Parent then break end
+            if Cfg.Checks.Team and TeamEq(Plr, tp) then break end
+            local h = ch:FindFirstChild("Head")
+            if not h then break end
+            if GetHP(ch) <= 0 then break end
+            local d = (h.Position - S.me.root.Position).Magnitude
+            if d < bestD then
+                if not Cfg.Checks.Wall or CanSee(h, S.me.char) then
+                    best = h
+                    bestD = d
+                end
+            end
+        until true
+    end
+    return best, bestD
+end
+
+local function InstallMagicBullet()
+    if S.magic.hookInstalled then return end
+    if not Exec.canSilent then
+        Notify("MAGIC BULLET", "hookmetamethod not supported", 3)
+        return
+    end
+    S.magic.hookInstalled = true
+    local wrap = newcclosure or function(f) return f end
+    pcall(function()
+        local oldNc
+        oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            if DEAD or not S.magic.on then return oldNc(self, ...) end
+            local m = getnamecallmethod()
+            if self == WS and m == "Raycast" then
+                local args = {...}
+                if #args >= 2 and typeof(args[1]) == "Vector3" then
+                    local head = FindNearestHead()
+                    if head then
+                        local origin = args[1]
+                        if (origin - S.me.root.Position).Magnitude < 50 then
+                            local dir = (head.Position - origin)
+                            if dir.Magnitude > 0.001 then
+                                S.magic.target = head
+                                local newDir = dir.Unit * 1000
+                                return oldNc(self, origin, newDir, select(3, ...))
+                            end
+                        end
+                    end
+                end
+            end
+            return oldNc(self, ...)
+        end))
+    end)
+    Notify("MAGIC BULLET", "Hook installed", 2)
+end
+
+local function ToggleMagicBullet()
+    S.magic.on = not S.magic.on
+    Cfg.MagicBullet.On = S.magic.on
+    if S.magic.on and not S.magic.hookInstalled then InstallMagicBullet() end
+    if not S.magic.on then S.magic.target = nil end
+end
+
+-- ---- 3rd Person Fix ----
+local function TPFix()
+    if not Cfg.TP.On then return end
+    if not S.me.alive or not S.me.root or not S.me.root.Parent then
+        S.tpRot = 0
+        return
+    end
+    if not S.tgt.part then
+        S.tpRot = 0
+        return
+    end
+    local dist = (S.me.root.Position - Cam.CFrame.Position).Magnitude
+    if dist > 10 then return end
+    local cl = Cam.CFrame.LookVector
+    local cf = Vector3.new(cl.X, 0, cl.Z)
+    if cf.Magnitude < 0.001 then return end
+    cf = cf.Unit
+    local chl = S.me.root.CFrame.LookVector
+    local chf = Vector3.new(chl.X, 0, chl.Z)
+    if chf.Magnitude < 0.001 then return end
+    chf = chf.Unit
+    local ang = math.deg(math.acos(math.clamp(cf:Dot(chf), -1, 1)))
+    if ang > Cfg.TP.MaxAngle then return end
+    local tgt
+    if cf:Dot(chf) > 0 then tgt = CFrame.new(S.me.root.Position, S.me.root.Position + cf)
+    else tgt = CFrame.new(S.me.root.Position, S.me.root.Position - cf) end
+    S.tpRot = math.min(S.tpRot + Cfg.TP.RotSpeed, 1)
+    local nc = S.me.root.CFrame:Lerp(tgt, S.tpRot)
+    local _, yaw, _ = nc:ToEulerAnglesYXZ()
+    pcall(function() S.me.root.CFrame = CFrame.new(S.me.root.Position) * CFrame.Angles(0, yaw, 0) end)
+end
+
+-- ---- ESP (Drawing API, reusable objects) ----
+local E = {}
+
+function E.New(uid)
+    if DEAD or S.esp[uid] or not drawOK then return end
+    local o = {}
+    o.box = ND("Square")
+    if o.box then pcall(function() o.box.Filled = false end) end
+    o.boxO = ND("Square")
+    if o.boxO then
+        pcall(function() o.boxO.Filled = false
+        o.boxO.Color = Color3.new(0,0,0) end)
+    end
+    o.cL = {}
+    o.cO = {}
+    for i = 1, 8 do
+        o.cL[i] = ND("Line")
+        o.cO[i] = ND("Line")
+    end
+    o.name = ND("Text")
+    if o.name then
+        pcall(function() o.name.Center = true
+        o.name.Outline = true
+        o.name.Size = Cfg.Name.Size end)
+    end
+    o.hpBg = ND("Square")
+    if o.hpBg then pcall(function() o.hpBg.Filled = true end) end
+    o.hpFill = ND("Square")
+    if o.hpFill then pcall(function() o.hpFill.Filled = true end) end
+    o.tracer = ND("Line")
+    o.hdot = ND("Circle")
+    if o.hdot then
+        pcall(function() o.hdot.Filled = true
+        o.hdot.NumSides = 10 end)
+    end
+    S.esp[uid] = o
+end
+
+function E.Hide(o)
+    if not o then return end
+    local keys = {"box", "boxO", "name", "hpBg", "hpFill", "tracer", "hdot"}
+    for _, k in ipairs(keys) do
+        if o[k] then pcall(function() o[k].Visible = false end) end
+    end
+    if o.cL then
+        for i = 1, 8 do
+            if o.cL[i] then pcall(function() o.cL[i].Visible = false end) end
+            if o.cO[i] then pcall(function() o.cO[i].Visible = false end) end
+        end
+    end
+end
+
+function E.Del(uid)
+    local o = S.esp[uid]
+    if not o then return end
+    E.Hide(o)
+    local keys = {"box", "boxO", "name", "hpBg", "hpFill", "tracer", "hdot"}
+    for _, k in ipairs(keys) do Kill(o[k]) end
+    if o.cL then
+        for i = 1, 8 do
+            Kill(o.cL[i])
+            Kill(o.cO[i])
+        end
+    end
+    S.esp[uid] = nil
+end
+
+function E.DelAll()
+    local keys = {}
+    for uid in pairs(S.esp) do table.insert(keys, uid) end
+    for _, uid in ipairs(keys) do E.Del(uid) end
+end
+
+function E.Render(uid, ch, dname, isTeam)
+    local o = S.esp[uid]
+    if not o then return end
+    if not ch or not ch.Parent then
+        E.Hide(o)
+        return
+    end
+    local rp = GetRoot(ch)
+    if not rp then
+        E.Hide(o)
+        return
+    end
+    local hp, mhp = GetHP(ch)
+    if hp <= 0 then
+        E.Hide(o)
+        return
+    end
+    if isTeam and not Cfg.ESP.ShowTeam then
+        E.Hide(o)
+        return
+    end
+    local rpPos = rp.Position
+    local dist = 0
+    if S.me.root then dist = (rpPos - S.me.root.Position).Magnitude end
+    if dist > Cfg.ESP.MaxDist then
+        E.Hide(o)
+        return
+    end
+    local head = ch:FindFirstChild("Head")
+    local topY = rpPos.Y + 3
+    if head then topY = head.Position.Y + 1 end
+    local botY = rpPos.Y - 3
+    local topSP, topOn = W2S(Vector3.new(rpPos.X, topY, rpPos.Z))
+    if not topOn or not topSP then
+        E.Hide(o)
+        return
+    end
+    local botSP, botOn = W2S(Vector3.new(rpPos.X, botY, rpPos.Z))
+    if not botOn or not botSP then
+        E.Hide(o)
+        return
+    end
+    local h = math.abs(botSP.Y - topSP.Y)
+    if h < 3 then
+        E.Hide(o)
+        return
+    end
+    local w = h * 0.6
+    local bx = topSP.X - w / 2
+    local by = topSP.Y
+    local vp = Cam.ViewportSize
+    if bx < -200 or bx > vp.X + 200 or by < -200 or by > vp.Y + 200 then
+        E.Hide(o)
+        return
+    end
+    local boxClr = Cfg.Box.Color
+    local nameClr = Cfg.Name.Color
+    if isTeam then
+        boxClr = Cfg.Box.TeamColor
+        nameClr = Cfg.Name.TeamColor
+    end
+    local distI = math.floor(dist)
+
+    if Cfg.Box.On then
+        if Cfg.Box.Style == "Full" then
+            for i = 1, 8 do
+                pcall(function() o.cL[i].Visible = false end)
+                pcall(function() o.cO[i].Visible = false end)
+            end
+            pcall(function()
+                o.box.Size = Vector2.new(w, h)
+                o.box.Position = Vector2.new(bx, by)
+                o.box.Color = boxClr
+                o.box.Thickness = Cfg.Box.Thickness
+                o.box.Visible = true
+            end)
+            if Cfg.Box.Outline then
+                pcall(function()
+                    o.boxO.Size = Vector2.new(w + 4, h + 4)
+                    o.boxO.Position = Vector2.new(bx - 2, by - 2)
+                    o.boxO.Color = Color3.new(0, 0, 0)
+                    o.boxO.Thickness = Cfg.Box.Thickness + 2
+                    o.boxO.Visible = true
+                end)
+            else
+                pcall(function() o.boxO.Visible = false end)
+            end
+        else
+            pcall(function() o.box.Visible = false end)
+            pcall(function() o.boxO.Visible = false end)
+            local cl = math.max(w, h) * 0.25
+            local pts = {
+                {bx, by, bx + cl, by},
+                {bx, by, bx, by + cl},
+                {bx + w, by, bx + w - cl, by},
+                {bx + w, by, bx + w, by + cl},
+                {bx, by + h, bx + cl, by + h},
+                {bx, by + h, bx, by + h - cl},
+                {bx + w, by + h, bx + w - cl, by + h},
+                {bx + w, by + h, bx + w, by + h - cl}
+            }
+            for i = 1, 8 do
+                pcall(function()
+                    o.cL[i].From = Vector2.new(pts[i][1], pts[i][2])
+                    o.cL[i].To   = Vector2.new(pts[i][3], pts[i][4])
+                    o.cL[i].Color = boxClr
+                    o.cL[i].Thickness = Cfg.Box.Thickness
+                    o.cL[i].Visible = true
+                end)
+                if Cfg.Box.Outline then
+                    pcall(function()
+                        o.cO[i].From = o.cL[i].From
+                        o.cO[i].To   = o.cL[i].To
+                        o.cO[i].Color = Color3.new(0, 0, 0)
+                        o.cO[i].Thickness = Cfg.Box.Thickness + 2
+                        o.cO[i].Visible = true
+                    end)
+                else
+                    pcall(function() o.cO[i].Visible = false end)
+                end
+            end
+        end
+    else
+        pcall(function() o.box.Visible = false end)
+        pcall(function() o.boxO.Visible = false end)
+        for i = 1, 8 do
+            pcall(function() o.cL[i].Visible = false end)
+            pcall(function() o.cO[i].Visible = false end)
+        end
+    end
+
+    if Cfg.Name.On and o.name then
+        local txt = dname
+        if Cfg.Name.Format == "Name+Dist" then txt = dname .. " [" .. distI .. "m]" end
+        pcall(function()
+            o.name.Text = txt
+            o.name.Color = nameClr
+            o.name.Size = Cfg.Name.Size
+            o.name.Position = Vector2.new(bx + w / 2, by - Cfg.Name.Size - 2)
+            o.name.Visible = true
+        end)
+    elseif o.name then
+        pcall(function() o.name.Visible = false end)
+    end
+
+    if Cfg.HP.On then
+        local pct = math.clamp(hp / math.max(mhp, 1), 0, 1)
+        local hc = HPCol(pct)
+        local bW = Cfg.HP.Width
+        local off = Cfg.HP.Offset
+        local bgX = bx - off - bW - 1
+        local fH = math.max(h * pct, 1)
+        pcall(function()
+            o.hpBg.Position = Vector2.new(bgX, by - 1)
+            o.hpBg.Size = Vector2.new(bW + 2, h + 2)
+            o.hpBg.Color = Cfg.HP.BgColor
+            o.hpBg.Visible = true
+        end)
+        pcall(function()
+            o.hpFill.Position = Vector2.new(bgX + 1, by + h - fH)
+            o.hpFill.Size = Vector2.new(bW, fH)
+            o.hpFill.Color = hc
+            o.hpFill.Visible = true
+        end)
+    else
+        pcall(function() o.hpBg.Visible = false end)
+        pcall(function() o.hpFill.Visible = false end)
+    end
+
+    if Cfg.Tracer.On and o.tracer then
+        pcall(function()
+            o.tracer.From = Vector2.new(vp.X / 2, vp.Y)
+            o.tracer.To = botSP
+            o.tracer.Color = Cfg.Tracer.Color
+            o.tracer.Thickness = Cfg.Tracer.Thickness
+            o.tracer.Visible = true
+        end)
+    elseif o.tracer then
+        pcall(function() o.tracer.Visible = false end)
+    end
+
+    if Cfg.HeadDot.On and head and o.hdot then
+        local sp, on = W2S(head.Position)
+        if sp and on then
+            pcall(function()
+                o.hdot.Position = sp
+                o.hdot.Radius = Cfg.HeadDot.Radius
+                o.hdot.Color = Cfg.HeadDot.Color
+                o.hdot.Visible = true
+            end)
+        else
+            pcall(function() o.hdot.Visible = false end)
+        end
+    elseif o.hdot then
+        pcall(function() o.hdot.Visible = false end)
+    end
+end
+
+function E.UpdateBatch()
+    if DEAD then return end
+    if not Cfg.ESP.On then return end
+    local count = #S.plList
+    if count <= 1 then return end
+    local rate = Cfg.Tick.ESP
+    if rate < 1 then rate = 1 end
+    local perFrame = math.max(math.ceil((count - 1) / rate), 1)
+    local start = S.espBatch
+    local done = 0
+    for i = 1, count do
+        if done >= perFrame then break end
+        local idx = ((start + i - 2) % count) + 1
+        local tp = S.plList[idx]
+        if tp and tp ~= Plr then
+            done = done + 1
+            local uid = tp.UserId
+            local ch = tp.Character
+            local skip = false
+            if not ch or not ch.Parent then skip = true end
+            if not skip and GetHP(ch) <= 0 then skip = true end
+            if skip then
+                if S.esp[uid] then E.Hide(S.esp[uid]) end
+            else
+                if not S.esp[uid] then E.New(uid) end
+                E.Render(uid, ch, tp.DisplayName or tp.Name, TeamEq(Plr, tp))
+            end
+        end
+    end
+    S.espBatch = (start + done) % math.max(count - 1, 1)
+    -- prune disconnected
+    if S.frame % 60 == 0 then
+        for uid in pairs(S.esp) do
+            local found = false
+            for _, tp in ipairs(S.plList) do
+                if tp.UserId == uid then
+                    found = true
+                    break
+                end
+            end
+            if not found then E.Del(uid) end
+        end
+    end
+end
+
+-- ---- WH (Highlight) ----
+local WH = {}
+
+function WH.Make(uid, ch, isTeam)
+    if DEAD or S.wh[uid] or not ch then return end
+    local hl = Instance.new("Highlight")
+    hl.Adornee = ch
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    if isTeam then
+        hl.FillColor = Cfg.WH.TeamFill
+        hl.OutlineColor = Cfg.WH.TeamLine
+    else
+        hl.FillColor = Cfg.WH.EnemyFill
+        hl.OutlineColor = Cfg.WH.EnemyLine
+    end
+    hl.FillTransparency = Cfg.WH.FT
+    hl.OutlineTransparency = 0
+    pcall(function() hl.Parent = ch end)
+    S.wh[uid] = hl
+end
+
+function WH.Kill(uid)
+    if S.wh[uid] then pcall(function() S.wh[uid]:Destroy() end) end
+    S.wh[uid] = nil
+end
+
+function WH.KillAll()
+    for k in pairs(S.wh) do pcall(function() S.wh[k]:Destroy() end) end
+    tclear(S.wh)
+end
+
+function WH.Update()
+    if DEAD then return end
+    if not Cfg.WH.On then
+        WH.KillAll()
+        return
+    end
+    local active = {}
+    for _, tp in ipairs(S.plList) do
+        repeat
+            if tp == Plr then break end
+            local uid = tp.UserId
+            local ch = tp.Character
+            local isTeam = TeamEq(Plr, tp)
+            local show = ch and ch.Parent and GetHP(ch) > 0
+            if show and isTeam and not Cfg.WH.ShowTeam then show = false end
+            if show then
+                active[uid] = true
+                if not S.wh[uid] then WH.Make(uid, ch, isTeam)
+                else
+                    pcall(function()
+                        if isTeam then
+                            S.wh[uid].FillColor = Cfg.WH.TeamFill
+                            S.wh[uid].OutlineColor = Cfg.WH.TeamLine
+                        else
+                            S.wh[uid].FillColor = Cfg.WH.EnemyFill
+                            S.wh[uid].OutlineColor = Cfg.WH.EnemyLine
+                        end
+                        S.wh[uid].FillTransparency = Cfg.WH.FT
+                    end)
+                end
+            else
+                WH.Kill(uid)
+            end
+        until true
+    end
+    for k in pairs(S.wh) do
+        if not active[k] then WH.Kill(k) end
+    end
+end
+
+-- ---- HUD (Drawing API) ----
+local HUD = {}
+
+function HUD.Destroy()
+    for _, d in pairs(S.draw) do Kill(d) end
+    S.draw = {}
+end
+
+function HUD.Create()
+    HUD.Destroy()
+    if not drawOK then return end
+    S.draw.fov = ND("Circle")
+    if S.draw.fov then
+        pcall(function() S.draw.fov.Filled = false
+        S.draw.fov.NumSides = 40 end)
+    end
+    S.draw.line = ND("Line")
+    S.draw.dot = ND("Circle")
+    if S.draw.dot then
+        pcall(function() S.draw.dot.Filled = true
+        S.draw.dot.NumSides = 10 end)
+    end
+    S.draw.st = ND("Text")
+    if S.draw.st then
+        pcall(function()
+            S.draw.st.Center = false
+            S.draw.st.Outline = true
+            S.draw.st.Size = SC(14, 12)
+            S.draw.st.Position = Vector2.new(10, SC(10, 40))
+            S.draw.st.Visible = true
+        end)
+    end
+    S.draw.mb = ND("Text")
+    if S.draw.mb then
+        pcall(function()
+            S.draw.mb.Center = false
+            S.draw.mb.Outline = true
+            S.draw.mb.Size = SC(12, 11)
+            S.draw.mb.Position = Vector2.new(10, SC(28, 58))
+            S.draw.mb.Color = Color3.fromRGB(255, 80, 80)
+        end)
+    end
+end
+
+function HUD.Update()
+    if DEAD or not drawOK then return end
+    local c = ScrC()
+    local d = S.draw
+    if d.fov then
+        pcall(function()
+            d.fov.Position = c
+            d.fov.Radius = Cfg.Aim.FOV
+            d.fov.Color = Cfg.UI.Accent
+            d.fov.Transparency = 0.7
+            d.fov.Thickness = 1.5
+            d.fov.Visible = Cfg.Aim.On and Cfg.Aim.FOVOn
+        end)
+    end
+    if d.st then
+        local modes = {Minimal = "MIN", Normal = "NORM", Silent = "SIL"}
+        local m = modes[Cfg.Aim.Mode] or "?"
+        local t = "XENO "
+        if Cfg.Aim.On then t = t .. "[" .. m .. "]" else t = t .. "[OFF]" end
+        if S.tgt.part and Cfg.Aim.On then
+            t = t .. string.format(" | %s %.0fHP", S.tgt.name, S.tgt.hp)
+        end
+        pcall(function()
+            d.st.Text = t
+            if Cfg.Aim.On then d.st.Color = Color3.fromRGB(100, 255, 100)
+            else d.st.Color = Color3.fromRGB(255, 100, 100) end
+        end)
+    end
+    if d.mb then
+        if S.magic.on then
+            pcall(function()
+                d.mb.Text = "MAGIC BULLET ON"
+                d.mb.Visible = true
+            end)
+        else
+            pcall(function() d.mb.Visible = false end)
+        end
+    end
+    if Cfg.Aim.On and S.tgt.part and S.tgt.vis then
+        local sp, on = W2S(S.tgt.part.Position)
+        if sp and on then
+            pcall(function()
+                d.line.From = c
+                d.line.To = sp
+                d.line.Color = Color3.new(1, 1, 1)
+                d.line.Thickness = 1.5
+                d.line.Visible = true
+            end)
+            pcall(function()
+                d.dot.Position = sp
+                d.dot.Color = Color3.fromRGB(255, 50, 50)
+                d.dot.Radius = SC(5, 8)
+                d.dot.Visible = true
+            end)
+        else
+            pcall(function() d.line.Visible = false end)
+            pcall(function() d.dot.Visible = false end)
+        end
+    else
+        pcall(function() d.line.Visible = false end)
+        pcall(function() d.dot.Visible = false end)
+    end
+end
+
+-- ---- Cleanup ----
+local function Cleanup()
+    DEAD = true
+    task.wait(0.05)
+    for _, c in ipairs(S.conns) do pcall(function() c:Disconnect() end) end
+    S.conns = {}
+    pcall(E.DelAll)
+    pcall(WH.KillAll)
+    pcall(HUD.Destroy)
+    if S.gui then pcall(function() S.gui:Destroy() end) end
+    if S.me.hum then pcall(function() S.me.hum.WalkSpeed = 16 end) end
+    _G.XenoLoaded = false
+    _G.XenoCleanup = nil
+end
+
+-- ---- Movement ----
+local function ApplyMovement(dt)
+    if not S.me.alive or not S.me.root then return end
+    if Cfg.Spin.On then
+        S.spinAng = (S.spinAng + Cfg.Spin.Spd * dt * 60) % 360
+        pcall(function()
+            S.me.root.CFrame = CFrame.new(S.me.root.Position) * CFrame.Angles(0, math.rad(S.spinAng), 0)
+        end)
+    end
+    if Cfg.Speed.On and S.me.hum then
+        pcall(function() S.me.hum.WalkSpeed = 16 * Cfg.Speed.Mult end)
+    end
+end
+
+-- ---- GUI ----
+local function BuildGUI()
+    if S.gui then pcall(function() S.gui:Destroy() end) end
+    S.theme = {accent = {}, bg = {}, panel = {}, text = {}, textDim = {}, btnBad = {}}
+    local MC   = Cfg.UI.Accent
+    local BG   = Cfg.UI.Background
+    local PNL  = Cfg.UI.Panel
+    local TXT  = Cfg.UI.Text
+    local TXTD = Cfg.UI.TextDim
+    local TOFF = Cfg.UI.Toggle
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "X_" .. math.random(100000, 900000)
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 999
+    gui.IgnoreGuiInset = true
+    Protect(gui)
+    gui.Parent = SafeP()
+    S.gui = gui
+
+    local mW = SC(460, 380)
+    local mH = SC(380, 340)
+    local main = Instance.new("Frame", gui)
+    main.Name = "MainFrame"
+    main.Size = UDim2.new(0, mW, 0, mH)
+    main.Position = UDim2.new(0.5, -mW / 2, 0.5, -mH / 2)
+    main.BackgroundColor3 = BG
+    main.BorderSizePixel = 0
+    main.Visible = false
+    main.Active = true
+    main.ClipsDescendants = true
+    local mc = Instance.new("UICorner", main)
+    mc.CornerRadius = UDim.new(0, 8)
+    table.insert(S.theme.bg, main)
+
+    local tl = Instance.new("TextLabel", main)
+    tl.Text = "XENO v17.0"
+    tl.Size = UDim2.new(1, -100, 0, 28)
+    tl.Position = UDim2.new(0, 10, 0, 4)
+    tl.BackgroundTransparency = 1
+    tl.TextColor3 = MC
+    tl.Font = Enum.Font.GothamBold
+    tl.TextSize = SC(15, 13)
+    tl.TextXAlignment = Enum.TextXAlignment.Left
+    tl.Active = true
+    table.insert(S.theme.accent, {obj = tl, prop = "TextColor3"})
+
+    local perfBtn = Instance.new("TextButton", main)
+    perfBtn.Text = "P"
+    perfBtn.Size = UDim2.new(0, 24, 0, 24)
+    perfBtn.Position = UDim2.new(1, -60, 0, 4)
+    perfBtn.BackgroundColor3 = Color3.fromRGB(60, 80, 140)
+    perfBtn.TextColor3 = Color3.new(1, 1, 1)
+    perfBtn.TextSize = SC(14, 12)
+    perfBtn.Font = Enum.Font.GothamBold
+    perfBtn.AutoButtonColor = false
+    local pbc = Instance.new("UICorner", perfBtn)
+    pbc.CornerRadius = UDim.new(0, 5)
+
+    local xb = Instance.new("TextButton", main)
+    xb.Text = "X"
+    xb.Size = UDim2.new(0, 24, 0, 24)
+    xb.Position = UDim2.new(1, -30, 0, 4)
+    xb.BackgroundColor3 = Cfg.UI.ButtonBad
+    xb.TextColor3 = Color3.new(1, 1, 1)
+    xb.TextSize = SC(14, 12)
+    xb.Font = Enum.Font.GothamBold
+    xb.AutoButtonColor = false
+    local xbc = Instance.new("UICorner", xb)
+    xbc.CornerRadius = UDim.new(0, 5)
+    xb.MouseButton1Click:Connect(function() main.Visible = false end)
+    table.insert(S.theme.btnBad, xb)
+
+    -- ==== makeDraggable: reusable drag for any frame ====
+    local function makeDraggable(target, handle)
+        local h = handle or target
+        local dragS, startP
+        local function onBegin(i)
+            local t1 = i.UserInputType == Enum.UserInputType.MouseButton1
+            local t2 = i.UserInputType == Enum.UserInputType.Touch
+            if t1 or t2 then
+                dragS = i.Position
+                startP = target.Position
+            end
+        end
+        h.InputBegan:Connect(onBegin)
+        table.insert(S.conns, UIS.InputChanged:Connect(function(i)
+            if not dragS then return end
+            local t1 = i.UserInputType == Enum.UserInputType.MouseMovement
+            local t2 = i.UserInputType == Enum.UserInputType.Touch
+            if t1 or t2 then
+                local d = i.Position - dragS
+                target.Position = UDim2.new(startP.X.Scale, startP.X.Offset + d.X, startP.Y.Scale, startP.Y.Offset + d.Y)
+            end
+        end))
+        table.insert(S.conns, UIS.InputEnded:Connect(function(i)
+            local t1 = i.UserInputType == Enum.UserInputType.MouseButton1
+            local t2 = i.UserInputType == Enum.UserInputType.Touch
+            if t1 or t2 then dragS = nil end
+        end))
+    end
+    makeDraggable(main, tl)
+    makeDraggable(main, main)
+
+    local tabBar = Instance.new("Frame", main)
+    tabBar.Size = UDim2.new(1, 0, 0, 26)
+    tabBar.Position = UDim2.new(0, 0, 0, 32)
+    tabBar.BackgroundTransparency = 1
+
+    local body = Instance.new("Frame", main)
+    body.Size = UDim2.new(1, -12, 1, -65)
+    body.Position = UDim2.new(0, 6, 0, 62)
+    body.BackgroundTransparency = 1
+    body.ClipsDescendants = true
+
+    local curTab = nil
+    local tabBtns = {}
+    local function mkTab(name, idx, tot)
+        local btn = Instance.new("TextButton", tabBar)
+        btn.Text = name
+        btn.Size = UDim2.new(1 / tot, 0, 1, 0)
+        btn.Position = UDim2.new((idx - 1) / tot, 0, 0, 0)
+        btn.BackgroundTransparency = 1
+        btn.TextColor3 = TXTD
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = SC(11, 10)
+        btn.AutoButtonColor = false
+        local sf = Instance.new("ScrollingFrame", body)
+        sf.Size = UDim2.new(1, 0, 1, 0)
+        sf.BackgroundTransparency = 1
+        sf.ScrollBarThickness = 2
+        sf.ScrollBarImageColor3 = MC
+        sf.BorderSizePixel = 0
+        sf.Visible = false
+        sf.CanvasSize = UDim2.new(0, 0, 0, 0)
+        local lay = Instance.new("UIListLayout", sf)
+        lay.Padding = UDim.new(0, 4)
+        lay.SortOrder = Enum.SortOrder.LayoutOrder
+        lay:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+            sf.CanvasSize = UDim2.new(0, 0, 0, lay.AbsoluteContentSize.Y + 8)
+        end)
+        btn.MouseButton1Click:Connect(function()
+            if curTab then curTab.Visible = false end
+            sf.Visible = true
+            curTab = sf
+            for _, b in pairs(tabBtns) do b.TextColor3 = TXTD end
+            btn.TextColor3 = MC
+        end)
+        tabBtns[name] = btn
+        return sf
+    end
+
+    local ord = 0
+    local function nOrd()
+        ord = ord + 1
+        return ord
+    end
+
+    local function mkTog(p, txt, t, k, cb)
+        local f = Instance.new("Frame", p)
+        f.Size = UDim2.new(1, 0, 0, SC(28, 34))
+        f.BackgroundColor3 = PNL
+        f.BorderSizePixel = 0
+        f.LayoutOrder = nOrd()
+        local fc = Instance.new("UICorner", f)
+        fc.CornerRadius = UDim.new(0, 5)
+        table.insert(S.theme.panel, f)
+        local l = Instance.new("TextLabel", f)
+        l.Text = txt
+        l.Size = UDim2.new(0.75, 0, 1, 0)
+        l.Position = UDim2.new(0, 8, 0, 0)
+        l.BackgroundTransparency = 1
+        l.TextColor3 = TXT
+        l.Font = Enum.Font.Gotham
+        l.TextSize = SC(10, 11)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        table.insert(S.theme.text, l)
+        local sw = SC(18, 22)
+        local dot = Instance.new("Frame", f)
+        dot.Size = UDim2.new(0, sw, 0, sw)
+        dot.Position = UDim2.new(1, -sw - 6, 0.5, -sw / 2)
+        if t[k] then dot.BackgroundColor3 = MC else dot.BackgroundColor3 = TOFF end
+        dot.BorderSizePixel = 0
+        local dc = Instance.new("UICorner", dot)
+        dc.CornerRadius = UDim.new(0, 4)
+        local btn = Instance.new("TextButton", f)
+        btn.Text = ""
+        btn.Size = UDim2.new(1, 0, 1, 0)
+        btn.BackgroundTransparency = 1
+        btn.MouseButton1Click:Connect(function()
+            t[k] = not t[k]
+            if t[k] then dot.BackgroundColor3 = Cfg.UI.Accent
+            else dot.BackgroundColor3 = Cfg.UI.Toggle end
+            if cb then pcall(cb, t[k]) end
+        end)
+        table.insert(S.theme.accent, {obj = dot, prop = "BackgroundColor3", getCond = function() return t[k] end})
+    end
+
+    local function mkSld(p, txt, mn, mx, t, k, fmt, cb)
+        if not fmt then fmt = "%.1f" end
+        local isInt = false
+        if fmt:find("%%d") or fmt:find("%%%.0f") then isInt = true end
+        local f = Instance.new("Frame", p)
+        f.Size = UDim2.new(1, 0, 0, SC(38, 44))
+        f.BackgroundColor3 = PNL
+        f.BorderSizePixel = 0
+        f.LayoutOrder = nOrd()
+        local fc = Instance.new("UICorner", f)
+        fc.CornerRadius = UDim.new(0, 5)
+        table.insert(S.theme.panel, f)
+        local l = Instance.new("TextLabel", f)
+        l.Text = string.format("%s: " .. fmt, txt, t[k])
+        l.Size = UDim2.new(1, -10, 0, 14)
+        l.Position = UDim2.new(0, 6, 0, 2)
+        l.BackgroundTransparency = 1
+        l.TextColor3 = TXT
+        l.TextSize = SC(9, 10)
+        l.Font = Enum.Font.Gotham
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        table.insert(S.theme.text, l)
+        local tr = Instance.new("Frame", f)
+        tr.Size = UDim2.new(1, -12, 0, SC(5, 7))
+        tr.Position = UDim2.new(0, 6, 0, SC(22, 24))
+        tr.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+        tr.BorderSizePixel = 0
+        local trc = Instance.new("UICorner", tr)
+        trc.CornerRadius = UDim.new(0, 3)
+        local pct = math.clamp((t[k] - mn) / (mx - mn), 0, 1)
+        local fl = Instance.new("Frame", tr)
+        fl.Size = UDim2.new(pct, 0, 1, 0)
+        fl.BackgroundColor3 = MC
+        fl.BorderSizePixel = 0
+        local flc = Instance.new("UICorner", fl)
+        flc.CornerRadius = UDim.new(0, 3)
+        table.insert(S.theme.accent, {obj = fl, prop = "BackgroundColor3"})
+        local drag = false
+        local hb = Instance.new("TextButton", f)
+        hb.Text = ""
+        hb.Size = UDim2.new(1, 4, 0, SC(18, 24))
+        hb.Position = UDim2.new(0, -2, 0, SC(16, 18))
+        hb.BackgroundTransparency = 1
+        hb.ZIndex = 5
+        local function upd(ix)
+            local ap = tr.AbsolutePosition.X
+            local as = tr.AbsoluteSize.X
+            if as <= 0 then return end
+            local r = math.clamp((ix - ap) / as, 0, 1)
+            local v = mn + r * (mx - mn)
+            if isInt then v = math.floor(v + 0.5) end
+            t[k] = v
+            fl.Size = UDim2.new(r, 0, 1, 0)
+            l.Text = string.format("%s: " .. fmt, txt, v)
+            if cb then pcall(cb, v) end
+        end
+        hb.InputBegan:Connect(function(i)
+            local t1 = i.UserInputType == Enum.UserInputType.MouseButton1
+            local t2 = i.UserInputType == Enum.UserInputType.Touch
+            if t1 or t2 then
+                drag = true
+                upd(i.Position.X)
+            end
+        end)
+        table.insert(S.conns, UIS.InputChanged:Connect(function(i)
+            if not drag then return end
+            local t1 = i.UserInputType == Enum.UserInputType.MouseMovement
+            local t2 = i.UserInputType == Enum.UserInputType.Touch
+            if t1 or t2 then upd(i.Position.X) end
+        end))
+        table.insert(S.conns, UIS.InputEnded:Connect(function(i)
+            local t1 = i.UserInputType == Enum.UserInputType.MouseButton1
+            local t2 = i.UserInputType == Enum.UserInputType.Touch
+            if t1 or t2 then drag = false end
+        end))
+    end
+
+    local function mkDD(p, txt, opts, t, k, cb)
+        local f = Instance.new("Frame", p)
+        f.Size = UDim2.new(1, 0, 0, SC(28, 34))
+        f.BackgroundColor3 = PNL
+        f.BorderSizePixel = 0
+        f.LayoutOrder = nOrd()
+        local fc = Instance.new("UICorner", f)
+        fc.CornerRadius = UDim.new(0, 5)
+        table.insert(S.theme.panel, f)
+        local l = Instance.new("TextLabel", f)
+        l.Text = txt
+        l.Size = UDim2.new(0.45, 0, 1, 0)
+        l.Position = UDim2.new(0, 8, 0, 0)
+        l.BackgroundTransparency = 1
+        l.TextColor3 = TXT
+        l.TextSize = SC(10, 11)
+        l.Font = Enum.Font.Gotham
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        table.insert(S.theme.text, l)
+        local btn = Instance.new("TextButton", f)
+        btn.Text = tostring(t[k])
+        btn.Size = UDim2.new(0.5, -6, 0.75, 0)
+        btn.Position = UDim2.new(0.48, 0, 0.125, 0)
+        btn.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+        btn.TextColor3 = MC
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = SC(10, 11)
+        btn.AutoButtonColor = false
+        local bc = Instance.new("UICorner", btn)
+        bc.CornerRadius = UDim.new(0, 4)
+        table.insert(S.theme.accent, {obj = btn, prop = "TextColor3"})
+        btn.MouseButton1Click:Connect(function()
+            local idx = table.find(opts, t[k]) or 0
+            idx = idx % #opts + 1
+            t[k] = opts[idx]
+            btn.Text = tostring(opts[idx])
+            if cb then pcall(cb, opts[idx]) end
+        end)
+    end
+
+    local function mkSep(p, txt)
+        local f = Instance.new("Frame", p)
+        f.Size = UDim2.new(1, 0, 0, 18)
+        f.BackgroundTransparency = 1
+        f.LayoutOrder = nOrd()
+        local l = Instance.new("TextLabel", f)
+        l.Text = "-- " .. txt .. " --"
+        l.Size = UDim2.new(1, 0, 1, 0)
+        l.BackgroundTransparency = 1
+        l.TextColor3 = MC
+        l.Font = Enum.Font.GothamBold
+        l.TextSize = SC(10, 10)
+        table.insert(S.theme.accent, {obj = l, prop = "TextColor3"})
+    end
+
+    local function mkRGB(p, label, t, k)
+        local f = Instance.new("Frame", p)
+        f.Size = UDim2.new(1, 0, 0, 32)
+        f.BackgroundColor3 = PNL
+        f.BorderSizePixel = 0
+        f.LayoutOrder = nOrd()
+        f.ClipsDescendants = true
+        local fc = Instance.new("UICorner", f)
+        fc.CornerRadius = UDim.new(0, 5)
+        table.insert(S.theme.panel, f)
+        local l = Instance.new("TextLabel", f)
+        l.Text = label
+        l.Size = UDim2.new(0.55, -8, 0, 32)
+        l.Position = UDim2.new(0, 8, 0, 0)
+        l.BackgroundTransparency = 1
+        l.TextColor3 = TXT
+        l.TextSize = SC(10, 11)
+        l.Font = Enum.Font.Gotham
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        table.insert(S.theme.text, l)
+        local rgbTxt = Instance.new("TextLabel", f)
+        rgbTxt.Size = UDim2.new(0, 100, 0, 32)
+        rgbTxt.Position = UDim2.new(1, -140, 0, 0)
+        rgbTxt.BackgroundTransparency = 1
+        rgbTxt.TextColor3 = TXTD
+        rgbTxt.TextSize = SC(9, 10)
+        rgbTxt.Font = Enum.Font.Code
+        rgbTxt.TextXAlignment = Enum.TextXAlignment.Right
+        table.insert(S.theme.textDim, rgbTxt)
+        local function updTxt()
+            local c = t[k]
+            rgbTxt.Text = string.format("%d, %d, %d", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+        end
+        updTxt()
+        local swatch = Instance.new("TextButton", f)
+        swatch.Text = ""
+        swatch.Size = UDim2.new(0, 32, 0, 22)
+        swatch.Position = UDim2.new(1, -38, 0, 5)
+        swatch.BackgroundColor3 = t[k]
+        swatch.BorderSizePixel = 0
+        swatch.AutoButtonColor = false
+        local sc2 = Instance.new("UICorner", swatch)
+        sc2.CornerRadius = UDim.new(0, 4)
+        local ss = Instance.new("UIStroke", swatch)
+        ss.Color = Color3.new(1, 1, 1)
+        local expanded = false
+        local built = false
+        local function makeChan(yOff, chName, chColor, getCur, setCur)
+            local cf = Instance.new("Frame", f)
+            cf.Size = UDim2.new(1, -16, 0, 22)
+            cf.Position = UDim2.new(0, 8, 0, yOff)
+            cf.BackgroundTransparency = 1
+            local lbl = Instance.new("TextLabel", cf)
+            lbl.Size = UDim2.new(0, 14, 1, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.TextColor3 = chColor
+            lbl.Font = Enum.Font.GothamBold
+            lbl.TextSize = SC(10, 11)
+            lbl.Text = chName
+            local val = Instance.new("TextLabel", cf)
+            val.Size = UDim2.new(0, 28, 1, 0)
+            val.Position = UDim2.new(1, -28, 0, 0)
+            val.BackgroundTransparency = 1
+            val.TextColor3 = TXT
+            val.Font = Enum.Font.Code
+            val.TextSize = SC(10, 11)
+            val.Text = tostring(math.floor(getCur() * 255 + 0.5))
+            local tr = Instance.new("Frame", cf)
+            tr.Size = UDim2.new(1, -50, 0, 6)
+            tr.Position = UDim2.new(0, 18, 0.5, -3)
+            tr.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+            tr.BorderSizePixel = 0
+            local trc = Instance.new("UICorner", tr)
+            trc.CornerRadius = UDim.new(0, 3)
+            local fl = Instance.new("Frame", tr)
+            fl.Size = UDim2.new(getCur(), 0, 1, 0)
+            fl.BackgroundColor3 = chColor
+            fl.BorderSizePixel = 0
+            local flc = Instance.new("UICorner", fl)
+            flc.CornerRadius = UDim.new(0, 3)
+            local drag = false
+            local hit = Instance.new("TextButton", cf)
+            hit.Text = ""
+            hit.Size = UDim2.new(1, -50, 1, 0)
+            hit.Position = UDim2.new(0, 18, 0, 0)
+            hit.BackgroundTransparency = 1
+            hit.ZIndex = 5
+            local function upd(x)
+                local ap = tr.AbsolutePosition.X
+                local as = tr.AbsoluteSize.X
+                if as <= 0 then return end
+                local r = math.clamp((x - ap) / as, 0, 1)
+                fl.Size = UDim2.new(r, 0, 1, 0)
+                val.Text = tostring(math.floor(r * 255 + 0.5))
+                setCur(r)
+                swatch.BackgroundColor3 = t[k]
+                updTxt()
+            end
+            hit.InputBegan:Connect(function(i)
+                local t1 = i.UserInputType == Enum.UserInputType.MouseButton1
+                local t2 = i.UserInputType == Enum.UserInputType.Touch
+                if t1 or t2 then
+                    drag = true
+                    upd(i.Position.X)
+                end
+            end)
+            table.insert(S.conns, UIS.InputChanged:Connect(function(i)
+                if not drag then return end
+                local t1 = i.UserInputType == Enum.UserInputType.MouseMovement
+                local t2 = i.UserInputType == Enum.UserInputType.Touch
+                if t1 or t2 then upd(i.Position.X) end
+            end))
+            table.insert(S.conns, UIS.InputEnded:Connect(function(i)
+                local t1 = i.UserInputType == Enum.UserInputType.MouseButton1
+                local t2 = i.UserInputType == Enum.UserInputType.Touch
+                if t1 or t2 then drag = false end
+            end))
+        end
+        swatch.MouseButton1Click:Connect(function()
+            expanded = not expanded
+            if expanded then
+                if not built then
+                    makeChan(36, "R", Color3.fromRGB(255, 80, 80), function() return t[k].R end, function(v) t[k] = Color3.new(v, t[k].G, t[k].B) end)
+                    makeChan(62, "G", Color3.fromRGB(80, 255, 80), function() return t[k].G end, function(v) t[k] = Color3.new(t[k].R, v, t[k].B) end)
+                    makeChan(88, "B", Color3.fromRGB(80, 130, 255), function() return t[k].B end, function(v) t[k] = Color3.new(t[k].R, t[k].G, v) end)
+                    built = true
+                end
+                f.Size = UDim2.new(1, 0, 0, 32 + 3 * 26 + 6)
+            else
+                f.Size = UDim2.new(1, 0, 0, 32)
+            end
+        end)
+    end
+
+    local tA  = mkTab("AIM",    1, 7)
+    local tE  = mkTab("ESP",    2, 7)
+    local tW  = mkTab("WH",     3, 7)
+    local tM  = mkTab("MISC",   4, 7)
+    local tMB = mkTab("MAGIC",  5, 7)
+    local tC  = mkTab("COLORS", 6, 7)
+    local tT  = mkTab("PERF",   7, 7)
+    tabBtns["AIM"].TextColor3 = MC
+    tA.Visible = true
+    curTab = tA
+
+    -- AIM TAB
+    ord = 0
+    mkSep(tA, "AIMBOT")
+    mkTog(tA, "Enabled", Cfg.Aim, "On")
+    mkDD (tA, "Mode", {"Minimal", "Normal", "Silent"}, Cfg.Aim, "Mode")
+    mkDD (tA, "Bone", {"Head", "UpperTorso", "HumanoidRootPart"}, Cfg.Aim, "Part")
+    mkTog(tA, "Sticky Target", Cfg.Aim, "Sticky")
+    mkTog(tA, "360 Aim", Cfg.Aim, "Aim360")
+    mkTog(tA, "FOV Circle", Cfg.Aim, "FOVOn")
+    mkSld(tA, "FOV Radius", 10, 500, Cfg.Aim, "FOV", "%.0f")
+    mkSep(tA, "SPEED / SMOOTH")
+    mkSld(tA, "Aim Speed", 0.1, 5.0, Cfg.Aim, "Speed", "%.2f")
+    mkSld(tA, "Smoothness (0=instant)", 0, 100, Cfg.Aim, "Smooth", "%.0f")
+    mkSep(tA, "PREDICTION")
+    mkTog(tA, "Prediction", Cfg.Aim, "Prediction")
+    mkSld(tA, "Pred Factor", 0.05, 0.5, Cfg.Aim, "PredFactor", "%.2f")
+    mkSep(tA, "CHECKS")
+    mkTog(tA, "Team Check", Cfg.Checks, "Team")
+    mkTog(tA, "Wall Check", Cfg.Checks, "Wall")
+
+    -- ESP TAB
+    ord = 0
+    mkSep(tE, "ESP")
+    mkTog(tE, "Enabled", Cfg.ESP, "On", function(v) if not v then E.DelAll() end end)
+    mkTog(tE, "Show Team", Cfg.ESP, "ShowTeam")
+    mkSld(tE, "Max Distance", 50, 3000, Cfg.ESP, "MaxDist", "%.0f")
+    mkSep(tE, "BOX")
+    mkTog(tE, "Box", Cfg.Box, "On")
+    mkDD (tE, "Style", {"Corner", "Full"}, Cfg.Box, "Style")
+    mkSld(tE, "Thickness", 0.5, 5, Cfg.Box, "Thickness", "%.1f")
+    mkTog(tE, "Outline", Cfg.Box, "Outline")
+    mkSep(tE, "NAME")
+    mkTog(tE, "Name Tag", Cfg.Name, "On")
+    mkDD (tE, "Format", {"Name+Dist", "Name"}, Cfg.Name, "Format")
+    mkSld(tE, "Font Size", 8, 24, Cfg.Name, "Size", "%.0f")
+    mkSep(tE, "HEALTH BAR")
+    mkTog(tE, "Health Bar", Cfg.HP, "On")
+    mkSld(tE, "Bar Width", 1, 10, Cfg.HP, "Width", "%.0f")
+    mkSld(tE, "Bar Offset", 0, 20, Cfg.HP, "Offset", "%.0f")
+    mkSep(tE, "TRACER")
+    mkTog(tE, "Tracer", Cfg.Tracer, "On")
+    mkSld(tE, "Thickness", 0.5, 5, Cfg.Tracer, "Thickness", "%.1f")
+    mkSep(tE, "HEAD DOT")
+    mkTog(tE, "Head Dot", Cfg.HeadDot, "On")
+    mkSld(tE, "Radius", 2, 10, Cfg.HeadDot, "Radius", "%.0f")
+
+    -- WH TAB
+    ord = 0
+    mkSep(tW, "WALLHACK")
+    mkTog(tW, "Enabled", Cfg.WH, "On", function(v) if not v then WH.KillAll() end end)
+    mkTog(tW, "Show Team", Cfg.WH, "ShowTeam")
+    mkSld(tW, "Fill Trans", 0, 1, Cfg.WH, "FT", "%.2f")
+
+    -- MISC TAB
+    ord = 0
+    mkSep(tM, "CAMERA / TP")
+    mkTog(tM, "3rd Person Fix", Cfg.TP, "On")
+    mkSld(tM, "Rotation Speed", 0.05, 1, Cfg.TP, "RotSpeed", "%.2f")
+    mkSld(tM, "Max Angle", 5, 180, Cfg.TP, "MaxAngle", "%.0f")
+    mkSep(tM, "MOVEMENT")
+    mkTog(tM, "SpinBot", Cfg.Spin, "On")
+    mkSld(tM, "Spin Speed", 1, 50, Cfg.Spin, "Spd", "%.0f")
+    mkTog(tM, "Speed Boost", Cfg.Speed, "On")
+    mkSld(tM, "Speed Mult", 1, 3, Cfg.Speed, "Mult", "%.2f")
+    mkSep(tM, "LIMITS")
+    mkSld(tM, "Max Distance", 100, 3000, Cfg.Limits, "MaxDist", "%.0f")
+    mkSld(tM, "Min Distance", 1, 100, Cfg.Limits, "MinDist", "%.0f")
+    mkSld(tM, "Max Angle", 10, 180, Cfg.Limits, "MaxAngle", "%.0f")
+    mkSep(tM, "SYSTEM")
+    local il = Instance.new("TextLabel", tM)
+    local silentStr = "N"
+    if Exec.canSilent then silentStr = "Y" end
+    il.Text = Exec.name .. " | Silent: " .. silentStr
+    il.Size = UDim2.new(1, 0, 0, 18)
+    il.BackgroundTransparency = 1
+    il.TextColor3 = TXTD
+    il.TextSize = SC(9, 10)
+    il.Font = Enum.Font.Gotham
+    il.LayoutOrder = nOrd()
+    table.insert(S.theme.textDim, il)
+    local ub = Instance.new("TextButton", tM)
+    ub.Text = "UNLOAD"
+    ub.Size = UDim2.new(1, 0, 0, SC(26, 32))
+    ub.BackgroundColor3 = Cfg.UI.ButtonBad
+    ub.TextColor3 = Color3.new(1, 1, 1)
+    ub.TextSize = SC(11, 12)
+    ub.Font = Enum.Font.GothamBold
+    ub.AutoButtonColor = false
+    ub.LayoutOrder = nOrd()
+    local ubc = Instance.new("UICorner", ub)
+    ubc.CornerRadius = UDim.new(0, 5)
+    ub.MouseButton1Click:Connect(function() Notify("XENO", "Bye", 2)
+    task.delay(0.3, Cleanup) end)
+    table.insert(S.theme.btnBad, ub)
+
+    -- MAGIC BULLET TAB
+    ord = 0
+    mkSep(tMB, "MAGIC BULLET")
+    mkTog(tMB, "Enabled", Cfg.MagicBullet, "On", function(v)
+        if v ~= S.magic.on then ToggleMagicBullet() end
+    end)
+    mkSld(tMB, "Max Range", 50, 500, Cfg.MagicBullet, "Range", "%.0f")
+    mkSep(tMB, "KEYBIND")
+    local kbLabel = Instance.new("TextLabel", tMB)
+    kbLabel.Text = "Current: " .. Cfg.MagicBullet.Keybind
+    kbLabel.Size = UDim2.new(1, 0, 0, 24)
+    kbLabel.BackgroundColor3 = PNL
+    kbLabel.BorderSizePixel = 0
+    kbLabel.TextColor3 = TXT
+    kbLabel.Font = Enum.Font.Gotham
+    kbLabel.TextSize = SC(10, 10)
+    kbLabel.LayoutOrder = nOrd()
+    local kbc = Instance.new("UICorner", kbLabel)
+    kbc.CornerRadius = UDim.new(0, 4)
+    table.insert(S.theme.panel, kbLabel)
+    table.insert(S.theme.text, kbLabel)
+    local kbBtn = Instance.new("TextButton", tMB)
+    kbBtn.Text = "BIND KEY"
+    kbBtn.Size = UDim2.new(1, 0, 0, SC(28, 34))
+    kbBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+    kbBtn.TextColor3 = MC
+    kbBtn.Font = Enum.Font.GothamBold
+    kbBtn.TextSize = SC(11, 12)
+    kbBtn.AutoButtonColor = false
+    kbBtn.LayoutOrder = nOrd()
+    local kbbc = Instance.new("UICorner", kbBtn)
+    kbbc.CornerRadius = UDim.new(0, 5)
+    table.insert(S.theme.accent, {obj = kbBtn, prop = "TextColor3"})
+    local kbActive = false
+    kbBtn.MouseButton1Click:Connect(function()
+        kbActive = not kbActive
+        if kbActive then
+            kbBtn.Text = "PRESS KEY..."
+            kbBtn.BackgroundColor3 = Cfg.UI.Accent
+        else
+            kbBtn.Text = "BIND KEY"
+            kbBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+        end
+    end)
+    table.insert(S.conns, UIS.InputBegan:Connect(function(i)
+        if not kbActive then return end
+        if i.UserInputType == Enum.UserInputType.Keyboard then
+            Cfg.MagicBullet.Keybind = i.KeyCode.Name
+            kbLabel.Text = "Current: " .. Cfg.MagicBullet.Keybind
+            kbActive = false
+            kbBtn.Text = "BIND KEY"
+            kbBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+        end
+    end))
+
+    -- COLORS TAB
+    ord = 0
+    mkSep(tC, "MENU THEME")
+    mkRGB(tC, "Accent",     Cfg.UI, "Accent")
+    mkRGB(tC, "Background", Cfg.UI, "Background")
+    mkRGB(tC, "Panel",      Cfg.UI, "Panel")
+    mkRGB(tC, "Text",       Cfg.UI, "Text")
+    mkRGB(tC, "Text Dim",   Cfg.UI, "TextDim")
+    mkRGB(tC, "Toggle Off", Cfg.UI, "Toggle")
+    mkRGB(tC, "Button Bad", Cfg.UI, "ButtonBad")
+    mkSep(tC, "ESP COLORS")
+    mkRGB(tC, "Enemy Box",  Cfg.Box,    "Color")
+    mkRGB(tC, "Team Box",   Cfg.Box,    "TeamColor")
+    mkRGB(tC, "Enemy Name", Cfg.Name,   "Color")
+    mkRGB(tC, "Team Name",  Cfg.Name,   "TeamColor")
+    mkRGB(tC, "HP Bar BG",  Cfg.HP,     "BgColor")
+    mkRGB(tC, "Tracer",     Cfg.Tracer, "Color")
+    mkRGB(tC, "Head Dot",   Cfg.HeadDot, "Color")
+    mkSep(tC, "WH COLORS")
+    mkRGB(tC, "Enemy Fill",    Cfg.WH, "EnemyFill")
+    mkRGB(tC, "Enemy Outline", Cfg.WH, "EnemyLine")
+    mkRGB(tC, "Team Fill",     Cfg.WH, "TeamFill")
+    mkRGB(tC, "Team Outline",  Cfg.WH, "TeamLine")
+    local function ApplyTheme()
+        for _, obj in ipairs(S.theme.bg)    do pcall(function() obj.BackgroundColor3 = Cfg.UI.Background end) end
+        for _, obj in ipairs(S.theme.panel) do pcall(function() obj.BackgroundColor3 = Cfg.UI.Panel end) end
+        for _, obj in ipairs(S.theme.text)  do pcall(function() obj.TextColor3 = Cfg.UI.Text end) end
+        for _, obj in ipairs(S.theme.textDim) do pcall(function() obj.TextColor3 = Cfg.UI.TextDim end) end
+        for _, e in ipairs(S.theme.accent) do
+            pcall(function()
+                if e.getCond then
+                    if e.getCond() then e.obj[e.prop] = Cfg.UI.Accent
+                    else e.obj[e.prop] = Cfg.UI.Toggle end
+                else
+                    e.obj[e.prop] = Cfg.UI.Accent
+                end
+            end)
+        end
+        for _, obj in ipairs(S.theme.btnBad) do pcall(function() obj.BackgroundColor3 = Cfg.UI.ButtonBad end) end
+    end
+    local applyBtn = Instance.new("TextButton", tC)
+    applyBtn.Text = "APPLY THEME"
+    applyBtn.Size = UDim2.new(1, 0, 0, SC(28, 34))
+    applyBtn.BackgroundColor3 = Cfg.UI.ButtonOK
+    applyBtn.TextColor3 = Color3.new(1, 1, 1)
+    applyBtn.TextSize = SC(11, 12)
+    applyBtn.Font = Enum.Font.GothamBold
+    applyBtn.AutoButtonColor = false
+    applyBtn.LayoutOrder = nOrd()
+    local apc = Instance.new("UICorner", applyBtn)
+    apc.CornerRadius = UDim.new(0, 5)
+    applyBtn.MouseButton1Click:Connect(function() ApplyTheme()
+    Notify("XENO", "Theme applied", 2) end)
+
+    -- PERF TAB
+    ord = 0
+    mkSep(tT, "UPDATE FREQUENCY")
+    local pi = Instance.new("TextLabel", tT)
+    pi.Text = "1 = every frame (max quality)\nN = every Nth frame (faster)"
+    pi.Size = UDim2.new(1, 0, 0, 32)
+    pi.BackgroundTransparency = 1
+    pi.TextColor3 = TXTD
+    pi.TextSize = SC(10, 10)
+    pi.Font = Enum.Font.Gotham
+    pi.LayoutOrder = nOrd()
+    table.insert(S.theme.textDim, pi)
+    mkSld(tT, "ESP every N players/frame", 1, 30, Cfg.Tick, "ESP", "%.0f")
+    mkSld(tT, "WH every N frames", 1, 60, Cfg.Tick, "WH", "%.0f")
+    mkSld(tT, "HUD every N frames", 1, 10, Cfg.Tick, "HUD", "%.0f")
+    mkSep(tT, "PRESETS")
+    local function preset(name, e, w, hud, col)
+        local b = Instance.new("TextButton", tT)
+        b.Text = name
+        b.Size = UDim2.new(1, 0, 0, SC(26, 32))
+        b.BackgroundColor3 = col
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.TextSize = SC(11, 11)
+        b.Font = Enum.Font.GothamBold
+        b.AutoButtonColor = true
+        b.LayoutOrder = nOrd()
+        local bc = Instance.new("UICorner", b)
+        bc.CornerRadius = UDim.new(0, 5)
+        b.MouseButton1Click:Connect(function()
+            Cfg.Tick.ESP = e
+            Cfg.Tick.WH = w
+            Cfg.Tick.HUD = hud
+            Notify("XENO", name, 2)
+        end)
+    end
+    preset("MAX QUALITY",     1,  1,  1, Color3.fromRGB(80, 200, 80))
+    preset("BALANCED",        3,  5,  2, Color3.fromRGB(80, 130, 220))
+    preset("MAX PERFORMANCE", 6, 10,  4, Color3.fromRGB(220, 130, 50))
+    preset("IDLE",           15, 30, 10, Color3.fromRGB(120, 120, 120))
+    mkSep(tT, "STATS")
+    local fpsLbl = Instance.new("TextLabel", tT)
+    fpsLbl.Text = "FPS: --"
+    fpsLbl.Size = UDim2.new(1, 0, 0, 18)
+    fpsLbl.BackgroundColor3 = PNL
+    fpsLbl.BorderSizePixel = 0
+    fpsLbl.TextColor3 = TXT
+    fpsLbl.Font = Enum.Font.Code
+    fpsLbl.TextSize = SC(11, 11)
+    fpsLbl.LayoutOrder = nOrd()
+    local fc2 = Instance.new("UICorner", fpsLbl)
+    fc2.CornerRadius = UDim.new(0, 4)
+    table.insert(S.theme.panel, fpsLbl)
+    table.insert(S.theme.text, fpsLbl)
+    local activeLbl = Instance.new("TextLabel", tT)
+    activeLbl.Text = "Active ESP: 0 | WH: 0"
+    activeLbl.Size = UDim2.new(1, 0, 0, 18)
+    activeLbl.BackgroundColor3 = PNL
+    activeLbl.BorderSizePixel = 0
+    activeLbl.TextColor3 = TXT
+    activeLbl.Font = Enum.Font.Code
+    activeLbl.TextSize = SC(11, 11)
+    activeLbl.LayoutOrder = nOrd()
+    local ac = Instance.new("UICorner", activeLbl)
+    ac.CornerRadius = UDim.new(0, 4)
+    table.insert(S.theme.panel, activeLbl)
+    table.insert(S.theme.text, activeLbl)
+    S.draw.fpsLbl = fpsLbl
+    S.draw.activeLbl = activeLbl
+
+    -- ==== PERF POPOVER ====
+    local pop = Instance.new("Frame", gui)
+    pop.Size = UDim2.new(0, 200, 0, 140)
+    pop.Position = UDim2.new(1, -210, 0, SC(50, 50))
+    pop.BackgroundColor3 = Cfg.UI.Background
+    pop.BorderSizePixel = 0
+    pop.Visible = false
+    pop.ZIndex = 50
+    local popc = Instance.new("UICorner", pop)
+    popc.CornerRadius = UDim.new(0, 6)
+    local pops = Instance.new("UIStroke", pop)
+    pops.Color = Cfg.UI.Accent
+    table.insert(S.theme.bg, pop)
+    local ptitle = Instance.new("TextLabel", pop)
+    ptitle.Text = "QUICK TICK"
+    ptitle.Size = UDim2.new(1, 0, 0, 18)
+    ptitle.BackgroundTransparency = 1
+    ptitle.TextColor3 = Cfg.UI.Accent
+    ptitle.Font = Enum.Font.GothamBold
+    ptitle.TextSize = SC(11, 11)
+    ptitle.ZIndex = 51
+    table.insert(S.theme.accent, {obj = ptitle, prop = "TextColor3"})
+    local function quickRow(yOff, lab, key, mx)
+        local row = Instance.new("Frame", pop)
+        row.Size = UDim2.new(1, -10, 0, 28)
+        row.Position = UDim2.new(0, 5, 0, yOff)
+        row.BackgroundColor3 = Cfg.UI.Panel
+        row.BorderSizePixel = 0
+        row.ZIndex = 51
+        local rc = Instance.new("UICorner", row)
+        rc.CornerRadius = UDim.new(0, 4)
+        table.insert(S.theme.panel, row)
+        local lbl = Instance.new("TextLabel", row)
+        lbl.Text = lab .. ": " .. Cfg.Tick[key]
+        lbl.Size = UDim2.new(0.55, 0, 1, 0)
+        lbl.Position = UDim2.new(0, 6, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.TextColor3 = Cfg.UI.Text
+        lbl.Font = Enum.Font.Code
+        lbl.TextSize = SC(10, 10)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.ZIndex = 52
+        table.insert(S.theme.text, lbl)
+        local mn = Instance.new("TextButton", row)
+        mn.Text = "-"
+        mn.Size = UDim2.new(0, 22, 0, 22)
+        mn.Position = UDim2.new(1, -52, 0.5, -11)
+        mn.BackgroundColor3 = Cfg.UI.Toggle
+        mn.TextColor3 = Cfg.UI.Text
+        mn.Font = Enum.Font.GothamBold
+        mn.TextSize = SC(14, 14)
+        mn.ZIndex = 52
+        local mnc = Instance.new("UICorner", mn)
+        mnc.CornerRadius = UDim.new(0, 4)
+        local pl = Instance.new("TextButton", row)
+        pl.Text = "+"
+        pl.Size = UDim2.new(0, 22, 0, 22)
+        pl.Position = UDim2.new(1, -26, 0.5, -11)
+        pl.BackgroundColor3 = Cfg.UI.Accent
+        pl.TextColor3 = Color3.new(1, 1, 1)
+        pl.Font = Enum.Font.GothamBold
+        pl.TextSize = SC(14, 14)
+        pl.ZIndex = 52
+        local plc = Instance.new("UICorner", pl)
+        plc.CornerRadius = UDim.new(0, 4)
+        table.insert(S.theme.accent, {obj = pl, prop = "BackgroundColor3"})
+        local function refresh() lbl.Text = lab .. ": " .. Cfg.Tick[key] end
+        mn.MouseButton1Click:Connect(function() Cfg.Tick[key] = math.max(Cfg.Tick[key] - 1, 1)
+        refresh() end)
+        pl.MouseButton1Click:Connect(function() Cfg.Tick[key] = math.min(Cfg.Tick[key] + 1, mx)
+        refresh() end)
+    end
+    quickRow(22, "ESP", "ESP", 30)
+    quickRow(54, "WH",  "WH",  60)
+    quickRow(86, "HUD", "HUD", 10)
+    local popClose = Instance.new("TextButton", pop)
+    popClose.Text = "CLOSE"
+    popClose.Size = UDim2.new(1, -10, 0, 22)
+    popClose.Position = UDim2.new(0, 5, 1, -26)
+    popClose.BackgroundColor3 = Cfg.UI.ButtonBad
+    popClose.TextColor3 = Color3.new(1, 1, 1)
+    popClose.Font = Enum.Font.GothamBold
+    popClose.TextSize = SC(10, 10)
+    popClose.ZIndex = 52
+    local pcc = Instance.new("UICorner", popClose)
+    pcc.CornerRadius = UDim.new(0, 4)
+    popClose.MouseButton1Click:Connect(function() pop.Visible = false end)
+    table.insert(S.theme.btnBad, popClose)
+    perfBtn.MouseButton1Click:Connect(function() pop.Visible = not pop.Visible end)
+
+    -- ==== FLOATING BUTTON ====
+    local obs = SC(36, 44)
+    local ob = Instance.new("TextButton", gui)
+    ob.Text = "X"
+    ob.Size = UDim2.new(0, obs, 0, obs)
+    ob.Position = UDim2.new(0, 12, 0, SC(90, 90))
+    ob.BackgroundColor3 = Cfg.UI.Accent
+    ob.TextColor3 = Color3.new(1, 1, 1)
+    ob.TextSize = SC(16, 18)
+    ob.Font = Enum.Font.GothamBlack
+    ob.AutoButtonColor = false
+    ob.Active = true
+    ob.ZIndex = 10
+    local obc = Instance.new("UICorner", ob)
+    obc.CornerRadius = UDim.new(1, 0)
+    local obs2 = Instance.new("UIStroke", ob)
+    obs2.Color = Color3.new(1, 1, 1)
+    obs2.Thickness = 2
+    table.insert(S.theme.accent, {obj = ob, prop = "BackgroundColor3"})
+    local oDrag = false
+    local oStart, oPos, oMoved = nil, nil, false
+    ob.InputBegan:Connect(function(i)
+        local t1 = i.UserInputType == Enum.UserInputType.MouseButton1
+        local t2 = i.UserInputType == Enum.UserInputType.Touch
+        if t1 or t2 then
+            oDrag = true
+            oStart = i.Position
+            oPos = ob.Position
+            oMoved = false
+        end
+    end)
+    table.insert(S.conns, UIS.InputChanged:Connect(function(i)
+        if not oDrag then return end
+        local t1 = i.UserInputType == Enum.UserInputType.MouseMovement
+        local t2 = i.UserInputType == Enum.UserInputType.Touch
+        if t1 or t2 then
+            local d = i.Position - oStart
+            if d.Magnitude > 6 then oMoved = true end
+            ob.Position = UDim2.new(oPos.X.Scale, oPos.X.Offset + d.X, oPos.Y.Scale, oPos.Y.Offset + d.Y)
+        end
+    end))
+    table.insert(S.conns, UIS.InputEnded:Connect(function(i)
+        if not oDrag then return end
+        local t1 = i.UserInputType == Enum.UserInputType.MouseButton1
+        local t2 = i.UserInputType == Enum.UserInputType.Touch
+        if t1 or t2 then
+            oDrag = false
+            if not oMoved then main.Visible = not main.Visible end
+        end
+    end))
+end
+
+-- ---- Keybinds ----
+local function SetupKeybinds()
+    table.insert(S.conns, UIS.InputBegan:Connect(function(i, gpe)
+        if DEAD or gpe then return end
+        if i.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        local kc = i.KeyCode
+        if kc == Enum.KeyCode.RightShift or kc == Enum.KeyCode.Insert then
+            if S.gui then
+                local mf = S.gui:FindFirstChild("MainFrame")
+                if mf then mf.Visible = not mf.Visible end
+            end
+        elseif kc == Enum.KeyCode.RightControl then
+            Cfg.Aim.On = not Cfg.Aim.On
+            if Cfg.Aim.On then Notify("AIM", "Enabled", 2) else Notify("AIM", "Disabled", 2) end
+        elseif kc.Name == Cfg.MagicBullet.Keybind then
+            ToggleMagicBullet()
+        elseif kc == Enum.KeyCode.End then
+            Cleanup()
+        end
+    end))
+end
+
+-- ---- Main Loop ----
+local function MainLoop()
+    table.insert(S.conns, RunService.RenderStepped:Connect(function(dt)
+        if DEAD then return end
+        S.frame = S.frame + 1
+        Cam = WS.CurrentCamera
+        if not Cam then return end
+        RefreshPL()
+        -- FPS calc
+        local now = tick()
+        local fdt = now - S.fpsLast
+        S.fpsLast = now
+        if fdt > 0 then S.fpsAvg = S.fpsAvg * 0.95 + (1 / fdt) * 0.05 end
+        -- Aim
+        local aimRate = Cfg.Tick.Aim
+        if aimRate < 1 then aimRate = 1 end
+        if S.frame % aimRate == 0 then
+            if Cfg.Aim.On and S.me.alive and S.me.root then
+                local part, plr = FindTarget()
+                if part then
+                    S.tgt.part = part
+                    S.tgt.plr = plr
+                    if plr then S.tgt.name = plr.Name end
+                    S.tgt.dist = (Cam.CFrame.Position - part.Position).Magnitude
+                    S.tgt.vis = true
+                    local ch = plr and plr.Character
+                    if ch then S.tgt.hp = GetHP(ch) end
+                    ApplyAim(part)
+                else
+                    if not Cfg.Aim.Sticky then
+                        S.tgt.part = nil
+                        S.tgt.plr = nil
+                        S.tgt.name = ""
+                        S.tgt.lastPos = nil
+                        S.tgt.vel = Vector3.zero
+                    end
+                    S.tgt.vis = false
+                end
+            else
+                if not Cfg.Aim.Sticky then
+                    S.tgt.part = nil
+                    S.tgt.plr = nil
+                end
+                S.tgt.vis = false
+            end
+        end
+        if Cfg.TP.On and S.me.alive and S.me.root and S.tgt.part then TPFix() end
+        ApplyMovement(dt)
+        E.UpdateBatch()
+        local hudRate = Cfg.Tick.HUD
+        if hudRate < 1 then hudRate = 1 end
+        if S.frame % hudRate == 0 then HUD.Update() end
+        -- Update stats labels
+        if S.frame % 30 == 0 and S.draw.fpsLbl then
+            pcall(function()
+                S.draw.fpsLbl.Text = string.format("FPS: %.0f", S.fpsAvg)
+                local ec, wc = 0, 0
+                for _ in pairs(S.esp) do ec = ec + 1 end
+                for _ in pairs(S.wh) do wc = wc + 1 end
+                S.draw.activeLbl.Text = "Active ESP: " .. ec .. " | WH: " .. wc
+            end)
+        end
+    end))
+    table.insert(S.conns, RunService.Heartbeat:Connect(function()
+        if DEAD then return end
+        if S.frame % Cfg.Tick.WH == 0 then WH.Update() end
+    end))
+end
+
+-- ---- Init ----
+_G.XenoCleanup = Cleanup
+table.insert(S.conns, Players.PlayerRemoving:Connect(function(p)
+    if DEAD then return end
+    E.Del(p.UserId)
+    WH.Kill(p.UserId)
+end))
+
+SetupChar()
 task.wait(0.5)
+HUD.Create()
+BuildGUI()
+SetupKeybinds()
+MainLoop()
 
-local _x1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x2 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x3 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x4 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x5 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x6 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x7 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x8 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x9 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x10 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x11 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x12 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x13 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x14 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x15 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x16 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x17 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x18 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x19 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x20 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x21 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x22 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x23 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x24 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x25 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x26 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x27 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x28 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x29 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x30 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x31 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x32 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x33 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x34 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x35 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x36 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x37 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x38 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x39 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x40 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x41 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x42 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x43 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x44 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x45 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x46 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x47 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x48 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x49 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x50 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x51 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x52 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x53 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x54 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x55 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x56 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x57 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x58 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x59 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x60 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x61 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x62 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x63 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x65 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x66 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x67 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x68 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x69 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x70 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x71 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x72 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x73 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x74 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x75 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x76 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x77 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x78 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x79 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x80 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x81 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x82 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x83 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x84 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x85 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x86 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x87 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x88 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x89 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x90 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x91 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x92 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x93 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x94 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x95 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x96 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x97 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x98 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x99 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x100 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x101 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x102 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x103 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x104 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x105 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x106 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x107 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x108 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x109 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x110 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x111 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x112 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x113 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x114 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x115 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x116 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x117 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x118 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x119 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x120 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x121 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x122 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x123 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x124 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x125 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x126 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x127 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x128 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x129 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x130 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x131 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x132 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x133 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x134 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x135 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "10kb", 3)
-task.wait(0.05)
-local _x136 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x137 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x138 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x139 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x140 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x141 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x142 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x143 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x144 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x145 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x146 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x147 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x148 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x149 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x150 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x151 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x152 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x153 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x154 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x155 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x156 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x157 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x158 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x159 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x160 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x161 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x162 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x163 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x164 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x165 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x166 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x167 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x168 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x169 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x170 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x171 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x172 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x173 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x174 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x175 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x176 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x177 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x178 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x179 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x180 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x181 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x182 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x183 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x184 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x185 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x186 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x187 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x188 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x189 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x190 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x191 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x192 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x193 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x194 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x195 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x196 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x197 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x198 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x199 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x200 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x201 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x202 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x203 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x204 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x205 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x206 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x207 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x208 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x209 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x210 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x211 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x212 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x213 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x214 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x215 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x216 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x217 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x218 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x219 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x220 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x221 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x222 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x223 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x224 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x225 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x226 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x227 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x228 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x229 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x230 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x231 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x232 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x233 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x234 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x235 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x236 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x237 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x238 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x239 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x240 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x241 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x242 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x243 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x244 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x245 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x246 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x247 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x248 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x249 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x250 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x251 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x252 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x253 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x254 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x255 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x257 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x258 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x259 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x260 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x261 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x262 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x263 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x264 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x265 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x266 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x267 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x268 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x269 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x270 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x271 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x272 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x273 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x274 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x275 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "20kb", 3)
-task.wait(0.05)
-local _x276 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x277 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x278 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x279 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x280 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x281 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x282 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x283 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x284 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x285 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x286 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x287 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x288 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x289 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x290 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x291 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x292 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x293 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x294 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x295 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x296 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x297 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x298 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x299 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x300 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x301 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x302 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x303 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x304 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x305 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x306 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x307 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x308 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x309 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x310 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x311 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x312 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x313 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x314 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x315 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x316 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x317 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x318 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x319 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x320 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x321 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x322 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x323 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x324 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x325 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x326 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x327 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x328 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x329 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x330 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x331 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x332 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x333 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x334 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x335 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x336 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x337 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x338 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x339 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x340 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x341 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x342 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x343 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x344 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x345 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x346 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x347 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x348 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x349 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x350 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x351 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x352 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x353 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x354 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x355 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x356 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x357 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x358 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x359 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x360 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x361 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x362 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x363 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x364 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x365 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x366 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x367 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x368 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x369 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x370 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x371 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x372 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x373 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x374 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x375 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x376 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x377 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x378 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x379 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x380 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x381 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x382 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x383 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x384 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x385 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x386 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x387 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x388 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x389 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x390 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x391 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x392 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x393 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x394 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x395 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x396 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x397 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x398 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x399 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x400 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x401 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x402 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x403 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x404 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x405 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x406 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x407 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x408 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x409 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x410 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x411 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x412 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x413 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x414 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x415 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "30kb", 3)
-task.wait(0.05)
-local _x416 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x417 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x418 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x419 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x420 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x421 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x422 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x423 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x424 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x425 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x426 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x427 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x428 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x429 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x430 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x431 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x432 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x433 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x434 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x435 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x436 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x437 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x438 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x439 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x440 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x441 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x442 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x443 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x444 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x445 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x446 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x447 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x448 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x449 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x450 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x451 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x452 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x453 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x454 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x455 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x456 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x457 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x458 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x459 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x460 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x461 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x462 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x463 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x464 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x465 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x466 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x467 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x468 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x469 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x470 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x471 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x472 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x473 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x474 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x475 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x476 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x477 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x478 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x479 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x480 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x481 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x482 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x483 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x484 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x485 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x486 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x487 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x488 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x489 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x490 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x491 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x492 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x493 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x494 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x495 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x496 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x497 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x498 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x499 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x500 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x501 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x502 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x503 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x504 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x505 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x506 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x507 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x508 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x509 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x510 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x511 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x512 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x513 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x514 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x515 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x516 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x517 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x518 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x519 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x520 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x521 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x522 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x523 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x524 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x525 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x526 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x527 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x528 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x529 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x530 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x531 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x532 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x533 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x534 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x535 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x536 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x537 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x538 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x539 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x540 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x541 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x542 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x543 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x544 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x545 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x546 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x547 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x548 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x549 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x550 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x551 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x552 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x553 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x554 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x555 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "40kb", 3)
-task.wait(0.05)
-local _x556 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x557 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x558 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x559 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x560 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x561 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x562 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x563 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x564 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x565 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x566 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x567 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x568 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x569 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x570 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x571 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x572 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x573 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x574 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x575 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x576 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x577 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x578 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x579 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x580 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x581 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x582 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x583 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x584 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x585 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x586 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x587 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x588 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x589 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x590 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x591 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x592 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x593 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x594 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x595 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x596 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x597 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x598 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x599 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x600 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x601 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x602 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x603 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x604 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x605 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x606 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x607 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x608 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x609 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x610 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x611 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x612 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x613 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x614 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x615 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x616 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x617 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x618 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x619 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x620 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x621 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x622 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x623 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x624 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x625 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x626 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x627 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x628 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x629 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x630 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x631 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x632 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x633 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x634 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x635 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x636 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x637 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x638 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x639 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x640 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x641 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x642 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x643 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x644 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x645 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x646 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x647 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x648 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x649 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x650 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x651 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x652 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x653 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x654 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x655 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x656 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x657 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x658 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x659 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x660 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x661 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x662 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x663 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x664 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x665 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x666 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x667 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x668 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x669 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x670 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x671 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x672 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x673 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x674 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x675 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x676 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x677 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x678 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x679 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x680 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x681 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x682 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x683 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x684 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x685 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x686 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x687 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x688 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x689 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x690 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x691 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x692 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x693 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x694 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "50kb", 3)
-task.wait(0.05)
-local _x695 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x696 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x697 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x698 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x699 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x700 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x701 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x702 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x703 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x704 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x705 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x706 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x707 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x708 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x709 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x710 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x711 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x712 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x713 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x714 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x715 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x716 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x717 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x718 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x719 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x720 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x721 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x722 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x723 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x724 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x725 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x726 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x727 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x728 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x729 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x730 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x731 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x732 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x733 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x734 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x735 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x736 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x737 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x738 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x739 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x740 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x741 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x742 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x743 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x744 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x745 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x746 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x747 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x748 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x749 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x750 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x751 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x752 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x753 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x754 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x755 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x756 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x757 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x758 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x759 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x760 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x761 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x762 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x763 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x764 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x765 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x766 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x767 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x768 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x769 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x770 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x771 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x772 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x773 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x774 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x775 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x776 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x777 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x778 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x779 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x780 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x781 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x782 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x783 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x784 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x785 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x786 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x787 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x788 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x789 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x790 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x791 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x792 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x793 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x794 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x795 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x796 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x797 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x798 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x799 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x800 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x801 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x802 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x803 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x804 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x805 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x806 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x807 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x808 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x809 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x810 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x811 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x812 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x813 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x814 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x815 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x816 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x817 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x818 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x819 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x820 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x821 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x822 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x823 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x824 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x825 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x826 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x827 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x828 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x829 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x830 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x831 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x832 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x833 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x834 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "60kb", 3)
-task.wait(0.05)
-local _x835 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x836 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x837 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x838 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x839 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x840 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x841 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x842 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x843 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x844 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x845 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x846 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x847 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x848 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x849 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x850 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x851 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x852 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x853 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x854 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x855 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x856 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x857 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x858 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x859 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x860 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x861 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x862 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x863 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x864 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x865 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x866 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x867 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x868 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x869 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x870 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x871 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x872 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x873 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x874 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x875 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x876 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x877 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x878 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x879 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x880 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x881 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x882 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x883 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x884 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x885 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x886 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x887 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x888 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x889 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x890 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x891 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x892 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x893 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x894 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x895 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x896 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x897 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x898 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x899 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x900 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x901 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x902 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x903 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x904 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x905 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x906 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x907 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x908 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x909 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x910 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x911 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x912 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x913 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x914 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x915 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x916 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x917 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x918 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x919 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x920 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x921 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x922 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x923 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x924 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x925 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x926 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x927 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x928 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x929 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x930 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x931 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x932 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x933 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x934 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x935 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x936 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x937 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x938 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x939 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x940 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x941 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x942 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x943 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x944 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x945 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x946 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x947 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x948 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x949 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x950 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x951 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x952 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x953 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x954 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x955 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x956 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x957 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x958 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x959 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x960 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x961 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x962 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x963 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x964 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x965 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x966 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x967 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x968 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x969 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x970 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x971 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x972 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x973 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x974 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "70kb", 3)
-task.wait(0.05)
-local _x975 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x976 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x977 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x978 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x979 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x980 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x981 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x982 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x983 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x984 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x985 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x986 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x987 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x988 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x989 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x990 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x991 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x992 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x993 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x994 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x995 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x996 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x997 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x998 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x999 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1000 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1001 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1002 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1003 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1004 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1005 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1006 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1007 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1008 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1009 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1010 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1011 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1012 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1013 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1014 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1015 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1016 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1017 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1018 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1019 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1020 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1021 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1022 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1023 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1024 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1025 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1026 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1027 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1028 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1029 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1030 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1031 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1032 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1033 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1034 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1035 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1036 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1037 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1038 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1039 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1040 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1041 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1042 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1043 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1044 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1045 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1046 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1047 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1048 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1049 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1050 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1051 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1052 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1053 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1054 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1055 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1056 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1057 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1058 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1059 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1060 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1061 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1062 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1063 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1064 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1065 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1066 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1067 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1068 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1069 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1070 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1071 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1072 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1073 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1074 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1075 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1076 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1077 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1078 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1079 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1080 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1081 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1082 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1083 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1084 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1085 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1086 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1087 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1088 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1089 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1090 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1091 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1092 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1093 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1094 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1095 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1096 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1097 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1098 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1099 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1100 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1101 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1102 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1103 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1104 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1105 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1106 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1107 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1108 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1109 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1110 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1111 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1112 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "80kb", 3)
-task.wait(0.05)
-local _x1113 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1114 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1115 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1116 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1117 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1118 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1119 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1120 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1121 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1122 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1123 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1124 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1125 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1126 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1127 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1128 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1129 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1130 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1131 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1132 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1133 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1134 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1135 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1136 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1137 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1138 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1139 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1140 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1141 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1142 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1143 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1144 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1145 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1146 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1147 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1148 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1149 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1150 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1151 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1152 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1153 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1154 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1155 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1156 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1157 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1158 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1159 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1160 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1161 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1162 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1163 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1164 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1165 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1166 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1167 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1168 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1169 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1170 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1171 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1172 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1173 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1174 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1175 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1176 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1177 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1178 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1179 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1180 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1181 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1182 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1183 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1184 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1185 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1186 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1187 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1188 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1189 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1190 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1191 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1192 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1193 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1194 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1195 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1196 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1197 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1198 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1199 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1200 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1201 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1202 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1203 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1204 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1205 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1206 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1207 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1208 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1209 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1210 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1211 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1212 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1213 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1214 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1215 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1216 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1217 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1218 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1219 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1220 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1221 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1222 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1223 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1224 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1225 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1226 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1227 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1228 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1229 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1230 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1231 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1232 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1233 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1234 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1235 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1236 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1237 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1238 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1239 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1240 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1241 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1242 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1243 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1244 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1245 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1246 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1247 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1248 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1249 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1250 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "90kb", 3)
-task.wait(0.05)
-local _x1251 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1252 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1253 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1254 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1255 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1257 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1258 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1259 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1260 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1261 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1262 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1263 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1264 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1265 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1266 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1267 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1268 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1269 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1270 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1271 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1272 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1273 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1274 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1275 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1276 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1277 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1278 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1279 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1280 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1281 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1282 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1283 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1284 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1285 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1286 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1287 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1288 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1289 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1290 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1291 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1292 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1293 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1294 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1295 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1296 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1297 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1298 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1299 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1300 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1301 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1302 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1303 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1304 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1305 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1306 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1307 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1308 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1309 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1310 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1311 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1312 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1313 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1314 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1315 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1316 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1317 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1318 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1319 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1320 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1321 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1322 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1323 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1324 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1325 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1326 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1327 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1328 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1329 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1330 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1331 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1332 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1333 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1334 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1335 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1336 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1337 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1338 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1339 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1340 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1341 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1342 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1343 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1344 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1345 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1346 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1347 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1348 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1349 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1350 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1351 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1352 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1353 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1354 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1355 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1356 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1357 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1358 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1359 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1360 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1361 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1362 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1363 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1364 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1365 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1366 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1367 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1368 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1369 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1370 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1371 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1372 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1373 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1374 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1375 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1376 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1377 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1378 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1379 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1380 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1381 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1382 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1383 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1384 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1385 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1386 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1387 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-local _x1388 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-n("CP", "100kb", 3)
-task.wait(0.05)
+Notify("XENO v17.0", "Loaded. RightShift = menu. End = unload.", 5)
 
-task.wait(1)
-n("DONE", "Reached 100kb - all OK!", 8)
