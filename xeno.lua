@@ -167,7 +167,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v17.4 [Eclipse]...", 3)
+Notify("XENO", "Loading v17.6 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -625,15 +625,27 @@ local function FindBestTarget()
     return bestPart, best
 end
 
+local silentCache = {part = nil, tick = 0}
+
 local function GetSilentAimTarget()
-    -- для silent aim используем текущую цель аимбота или ищем новую
-    if S.tgt.part and S.tgt.plr and S.tgt.vis then
-        local ch = S.tgt.plr.Character
-        if ch and ch.Parent and GetHP(ch) > 0 then
-            return S.tgt.part
-        end
+    -- FAST: use current aim target directly (updated every frame in main loop)
+    -- no heavy FindBestTarget in hook — just return what we already have
+    local p = S.tgt.part
+    if p and p.Parent then
+        return p
     end
+    
+    -- fallback: cached search, max once per 0.1s
+    local now = tick()
+    if now - silentCache.tick < 0.1 then
+        local cp = silentCache.part
+        if cp and cp.Parent then return cp end
+        return nil
+    end
+    
+    silentCache.tick = now
     local part, _ = FindBestTarget()
+    silentCache.part = part
     return part
 end
 
@@ -647,137 +659,83 @@ local function InstallSilentHooks()
     S.magic.hookInstalled = true
     local wrap = newcclosure or function(f) return f end
     
-    -- Hook __namecall for Raycast, FindPartOnRay, etc
+    -- Cached references for speed (avoid global lookups in hot path)
+    local cachedWS = WS
+    local cachedCam = Cam
+    
     pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            -- FAST PATH: 99.9% of calls hit this and exit immediately
+            -- Only Workspace raycasts and Camera CFrame reads matter
+            if self ~= cachedWS and self ~= cachedCam then
+                return oldNc(self, ...)
+            end
+            
             if DEAD then return oldNc(self, ...) end
             
-            local method = getnamecallmethod()
-            local args = {...}
+            -- Check if anything is even enabled
+            local magicOn = S.magic.on
+            local silentOn = Cfg.Aim.On and Cfg.Aim.Mode == "Silent" and S.tgt.part ~= nil
+            if not magicOn and not silentOn then
+                return oldNc(self, ...)
+            end
             
-            -- Magic Bullet: redirect raycast direction
-            if S.magic.on and self == WS then
-                -- Workspace:Raycast(origin, direction, params)
-                if method == "Raycast" and #args >= 2 then
-                    if typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
+            local method = getnamecallmethod()
+            
+            -- === WORKSPACE: redirect raycasts ===
+            if magicOn and self == cachedWS then
+                -- Raycast (new API)
+                if method == "Raycast" then
+                    local args = {...}
+                    if #args >= 2 and typeof(args[1]) == "Vector3" then
                         local origin = args[1]
-                        -- check if raycast is from player (near camera/root)
-                        local fromPlayer = false
-                        if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then
-                            fromPlayer = true
-                        end
-                        if Cam and (origin - Cam.CFrame.Position).Magnitude < 10 then
-                            fromPlayer = true
-                        end
-                        
-                        if fromPlayer then
-                            local targetPart, _ = FindBestTarget()
-                            if targetPart then
-                                local newDir = (targetPart.Position - origin)
-                                if newDir.Magnitude > 0.001 then
-                                    S.magic.target = targetPart
-                                    newDir = newDir.Unit * args[2].Magnitude
-                                    return oldNc(self, origin, newDir, select(3, ...))
+                        -- quick distance check instead of multiple branches
+                        local isPlayer = (S.me.root and (origin - S.me.root.Position).Magnitude < 50)
+                            or (cachedCam and (origin - cachedCam.CFrame.Position).Magnitude < 10)
+                        if isPlayer then
+                            local tp = GetSilentAimTarget()
+                            if tp then
+                                local d = tp.Position - origin
+                                if d.Magnitude > 0.001 then
+                                    S.magic.target = tp
+                                    return oldNc(self, origin, d.Unit * args[2].Magnitude, select(3, ...))
                                 end
                             end
                         end
                     end
+                    return oldNc(self, ...)
                 end
                 
-                -- Workspace:FindPartOnRay(ray, ignoreList, ...)
-                if method == "FindPartOnRay" and #args >= 1 then
-                    if typeof(args[1]) == "Ray" then
+                -- FindPartOnRay / WithIgnoreList / WithWhitelist (old API)
+                if method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
+                    local args = {...}
+                    if #args >= 1 and typeof(args[1]) == "Ray" then
                         local ray = args[1]
                         local origin = ray.Origin
-                        local fromPlayer = false
-                        if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then
-                            fromPlayer = true
-                        end
-                        if Cam and (origin - Cam.CFrame.Position).Magnitude < 10 then
-                            fromPlayer = true
-                        end
-                        
-                        if fromPlayer then
-                            local targetPart, _ = FindBestTarget()
-                            if targetPart then
-                                local newDir = (targetPart.Position - origin)
-                                if newDir.Magnitude > 0.001 then
-                                    S.magic.target = targetPart
-                                    local newRay = Ray.new(origin, newDir.Unit * ray.Direction.Magnitude)
-                                    return oldNc(self, newRay, select(2, ...))
+                        local isPlayer = (S.me.root and (origin - S.me.root.Position).Magnitude < 50)
+                            or (cachedCam and (origin - cachedCam.CFrame.Position).Magnitude < 10)
+                        if isPlayer then
+                            local tp = GetSilentAimTarget()
+                            if tp then
+                                local d = tp.Position - origin
+                                if d.Magnitude > 0.001 then
+                                    S.magic.target = tp
+                                    return oldNc(self, Ray.new(origin, d.Unit * ray.Direction.Magnitude), select(2, ...))
                                 end
                             end
                         end
                     end
-                end
-                
-                -- Workspace:FindPartOnRayWithIgnoreList(ray, ignoreList, ...)
-                if method == "FindPartOnRayWithIgnoreList" and #args >= 1 then
-                    if typeof(args[1]) == "Ray" then
-                        local ray = args[1]
-                        local origin = ray.Origin
-                        local fromPlayer = false
-                        if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then
-                            fromPlayer = true
-                        end
-                        if Cam and (origin - Cam.CFrame.Position).Magnitude < 10 then
-                            fromPlayer = true
-                        end
-                        
-                        if fromPlayer then
-                            local targetPart, _ = FindBestTarget()
-                            if targetPart then
-                                local newDir = (targetPart.Position - origin)
-                                if newDir.Magnitude > 0.001 then
-                                    S.magic.target = targetPart
-                                    local newRay = Ray.new(origin, newDir.Unit * ray.Direction.Magnitude)
-                                    return oldNc(self, newRay, select(2, ...))
-                                end
-                            end
-                        end
-                    end
-                end
-                
-                -- Workspace:FindPartOnRayWithWhitelist(ray, whitelist, ...)
-                if method == "FindPartOnRayWithWhitelist" and #args >= 1 then
-                    if typeof(args[1]) == "Ray" then
-                        local ray = args[1]
-                        local origin = ray.Origin
-                        local fromPlayer = false
-                        if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then
-                            fromPlayer = true
-                        end
-                        if Cam and (origin - Cam.CFrame.Position).Magnitude < 10 then
-                            fromPlayer = true
-                        end
-                        
-                        if fromPlayer then
-                            local targetPart, _ = FindBestTarget()
-                            if targetPart then
-                                local newDir = (targetPart.Position - origin)
-                                if newDir.Magnitude > 0.001 then
-                                    S.magic.target = targetPart
-                                    local newRay = Ray.new(origin, newDir.Unit * ray.Direction.Magnitude)
-                                    return oldNc(self, newRay, select(2, ...))
-                                end
-                            end
-                        end
-                    end
+                    return oldNc(self, ...)
                 end
             end
             
-            -- Silent Aim: intercept camera lookups and return fake CFrame
-            if Cfg.Aim.On and Cfg.Aim.Mode == "Silent" then
-                -- Camera:GetRenderCFrame(), CurrentCamera.CFrame, etc
-                if self == Cam or (typeof(self) == "Instance" and self:IsA("Camera")) then
-                    if method == "GetRenderCFrame" or method == "GetCFrame" then
-                        local targetPart = GetSilentAimTarget()
-                        if targetPart then
-                            local camPos = Cam.CFrame.Position
-                            local fakeCF = CFrame.lookAt(camPos, targetPart.Position)
-                            return fakeCF
-                        end
+            -- === CAMERA: fake CFrame for silent aim ===
+            if silentOn and self == cachedCam then
+                if method == "GetRenderCFrame" or method == "GetCFrame" then
+                    local tp = GetSilentAimTarget()
+                    if tp then
+                        return CFrame.lookAt(cachedCam.CFrame.Position, tp.Position)
                     end
                 end
             end
@@ -786,29 +744,12 @@ local function InstallSilentHooks()
         end))
     end)
     
-    -- Hook __index for Camera.CFrame reads (Silent Aim)
-    pcall(function()
-        local oldIdx
-        oldIdx = hookmetamethod(game, "__index", wrap(function(self, key)
-            if DEAD then return oldIdx(self, key) end
-            
-            -- Silent Aim: fake camera CFrame
-            if Cfg.Aim.On and Cfg.Aim.Mode == "Silent" then
-                if (self == Cam or (typeof(self) == "Instance" and self:IsA("Camera"))) then
-                    if key == "CFrame" or key == "CoordinateFrame" then
-                        local targetPart = GetSilentAimTarget()
-                        if targetPart then
-                            local realCF = oldIdx(self, key)
-                            local fakeCF = CFrame.lookAt(realCF.Position, targetPart.Position)
-                            return fakeCF
-                        end
-                    end
-                end
-            end
-            
-            return oldIdx(self, key)
-        end))
-    end)
+    -- Update cached camera ref when it changes
+    table.insert(S.conns, WS:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        cachedCam = WS.CurrentCamera
+    end))
+    
+    -- NO __index hook — it fires on every property read and kills FPS
     
     Notify("SILENT/MAGIC", "Hooks installed", 2)
 end
@@ -1570,7 +1511,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextLabel", main)
-    tl.Text = "XENO v17.4 [Eclipse]"
+    tl.Text = "XENO v17.6 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2474,4 +2415,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.4", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v17.6", "Loaded [Eclipse]. Tap X button to open menu.", 5)
