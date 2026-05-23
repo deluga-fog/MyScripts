@@ -294,7 +294,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v17.8 [Eclipse]...", 3)
+Notify("XENO", "Loading v17.9 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -777,110 +777,73 @@ local function GetSilentAimTarget()
 end
 
 local function InstallSilentHooks()
-    if S.magic.hookInstalled then 
-        Log("HOOK", "Already installed, skipping")
-        return 
-    end
-    
-    Log("HOOK", "Starting hook installation...")
-    Log("HOOK", "Exec.canSilent = " .. tostring(Exec.canSilent))
+    if S.magic.hookInstalled then return end
     
     if not Exec.canSilent then
-        Log("HOOK", "FAILED: hookmetamethod not available")
-        Notify("SILENT/MAGIC", "hookmetamethod not supported", 3)
+        Notify("SILENT/MAGIC", "Not supported", 3)
         return
     end
     
     S.magic.hookInstalled = true
     DebugLog.hookStats.installed = true
-    
     local wrap = newcclosure or function(f) return f end
-    Log("HOOK", "newcclosure available: " .. tostring(newcclosure ~= nil))
     
-    -- Cached references for speed
     local cachedWS = WS
     local cachedCam = Cam
-    Log("HOOK", "Cached WS: " .. tostring(cachedWS))
-    Log("HOOK", "Cached Cam: " .. tostring(cachedCam))
     
-    local hookSuccess, hookErr = pcall(function()
+    pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            -- MEGA FAST PATH: 0.00001ms overhead
-            if self ~= cachedWS and self ~= cachedCam then
-                return oldNc(self, ...)
-            end
-            
-            if DEAD then return oldNc(self, ...) end
-
-            -- Stats only for relevant calls to save FPS
-            DebugLog.hookStats.totalCalls = DebugLog.hookStats.totalCalls + 1
-            DebugLog.hookStats.lastCallTime = tick()
-            
+            -- THE FASTEST POSSIBLE FILTER
             if self == cachedWS then
-                DebugLog.hookStats.wsCalls = DebugLog.hookStats.wsCalls + 1
-            else
-                DebugLog.hookStats.camCalls = DebugLog.hookStats.camCalls + 1
-            end
-            
-            -- Check if anything is enabled
-            local magicOn = S.magic.on
-            local silentOn = Cfg.Aim.On and Cfg.Aim.Mode == "Silent" and S.tgt.part ~= nil
-            if not magicOn and not silentOn then
-                return oldNc(self, ...)
-            end
-            
-            local method = getnamecallmethod()
-            
-            -- === WORKSPACE: redirect raycasts ===
-            if magicOn and self == cachedWS then
-                if method == "Raycast" then
-                    local args = {...}
-                    if #args >= 2 and typeof(args[1]) == "Vector3" then
-                        local origin = args[1]
-                        local isPlayer = (S.me.root and (origin - S.me.root.Position).Magnitude < 50)
-                            or (cachedCam and (origin - cachedCam.CFrame.Position).Magnitude < 10)
-                        if isPlayer then
-                            local tp = GetSilentAimTarget()
-                            if tp then
-                                local d = tp.Position - origin
-                                if d.Magnitude > 0.001 then
-                                    S.magic.target = tp
-                                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
-                                    return oldNc(self, origin, d.Unit * args[2].Magnitude, select(3, ...))
-                                end
-                            end
-                        end
-                    end
-                    return oldNc(self, ...)
-                end
+                local magicOn = S.magic.on
+                if not magicOn then return oldNc(self, ...) end
                 
-                if method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
+                local method = getnamecallmethod()
+                -- Only care about raycasting
+                if method == "Raycast" or method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
                     local args = {...}
-                    if #args >= 1 and typeof(args[1]) == "Ray" then
+                    local origin, direction, mag
+                    
+                    if method == "Raycast" then
+                        origin = args[1]
+                        direction = args[2]
+                        if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return oldNc(self, ...) end
+                        mag = direction.Magnitude
+                    else
                         local ray = args[1]
-                        local origin = ray.Origin
-                        local isPlayer = (S.me.root and (origin - S.me.root.Position).Magnitude < 50)
-                            or (cachedCam and (origin - cachedCam.CFrame.Position).Magnitude < 10)
-                        if isPlayer then
-                            local tp = GetSilentAimTarget()
-                            if tp then
-                                local d = tp.Position - origin
-                                if d.Magnitude > 0.001 then
-                                    S.magic.target = tp
-                                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
-                                    return oldNc(self, Ray.new(origin, d.Unit * ray.Direction.Magnitude), select(2, ...))
-                                end
+                        if typeof(ray) ~= "Ray" then return oldNc(self, ...) end
+                        origin = ray.Origin
+                        direction = ray.Direction
+                        mag = direction.Magnitude
+                    end
+
+                    -- Optimization: Only redirect "long" rays (bullets), ignore short ones (footsteps/interact)
+                    if mag < 5 then return oldNc(self, ...) end
+
+                    -- Check if origin is from player
+                    local isPlayer = (S.me.root and (origin - S.me.root.Position).Magnitude < 50)
+                                  or (cachedCam and (origin - cachedCam.CFrame.Position).Magnitude < 20)
+                    
+                    if isPlayer then
+                        local tp = GetSilentAimTarget()
+                        if tp then
+                            local newDir = (tp.Position - origin).Unit * mag
+                            DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                            if method == "Raycast" then
+                                return oldNc(self, origin, newDir, select(3, ...))
+                            else
+                                return oldNc(self, Ray.new(origin, newDir), select(2, ...))
                             end
                         end
                     end
-                    return oldNc(self, ...)
                 end
-            end
-            
-            -- === CAMERA: fake CFrame ===
-            if silentOn and self == cachedCam then
-                if method == "GetRenderCFrame" or method == "GetCFrame" then
+            elseif self == cachedCam then
+                local silentOn = Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
+                if not silentOn then return oldNc(self, ...) end
+                
+                local method = getnamecallmethod()
+                if method == "GetRenderCFrame" or method == "GetCFrame" or method == "get_CFrame" then
                     local tp = GetSilentAimTarget()
                     if tp then
                         DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
@@ -891,7 +854,6 @@ local function InstallSilentHooks()
             
             return oldNc(self, ...)
         end))
-        Log("HOOK", "hookmetamethod __namecall SUCCESS")
     end)
     
     if not hookSuccess then
@@ -1676,8 +1638,8 @@ local function BuildGUI()
     mc.CornerRadius = UDim.new(0, 8)
     table.insert(S.theme.bg, main)
 
-    local tl = Instance.new("TextLabel", main)
-    tl.Text = "XENO v17.8 [Eclipse]"
+    local tl = Instance.new("TextButton", main)
+    tl.Text = "XENO v17.9 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -1686,7 +1648,13 @@ local function BuildGUI()
     tl.TextSize = SC(15, 13)
     tl.TextXAlignment = Enum.TextXAlignment.Left
     tl.Active = true
+    tl.AutoButtonColor = false
     table.insert(S.theme.accent, {obj = tl, prop = "TextColor3"})
+    
+    -- Hidden feature: click title to copy log
+    tl.Activated:Connect(function()
+        CopyDebugLog()
+    end)
 
     local perfBtn = Instance.new("TextButton", main)
     perfBtn.Text = "P"
@@ -2228,32 +2196,16 @@ local function BuildGUI()
         CopyDebugLog()
     end)
     
-    -- Hook stats label (updates live)
-    local hookLbl = Instance.new("TextLabel", tM)
-    hookLbl.Text = "Hook: checking..."
-    hookLbl.Size = UDim2.new(1, 0, 0, 14)
-    hookLbl.BackgroundTransparency = 1
-    hookLbl.TextColor3 = TXTD
-    hookLbl.TextSize = SC(8, 9)
-    hookLbl.Font = Enum.Font.Code
-    hookLbl.LayoutOrder = nOrd()
-    table.insert(S.theme.textDim, hookLbl)
-    
-    -- Update hook stats every second
-    task.spawn(function()
-        while not DEAD and hookLbl and hookLbl.Parent do
-            local stats = DebugLog.hookStats
-            local txt = string.format("Hook:%s | Calls:%d | WS:%d | Cam:%d | Redir:%d",
-                stats.installed and "Y" or "N",
-                stats.totalCalls,
-                stats.wsCalls,
-                stats.camCalls,
-                stats.redirects
-            )
-            pcall(function() hookLbl.Text = txt end)
-            task.wait(1)
-        end
-    end)
+    -- Live stats removed for performance. Use the copy button.
+    local infoLbl = Instance.new("TextLabel", tM)
+    infoLbl.Text = "Stats included in debug report"
+    infoLbl.Size = UDim2.new(1, 0, 0, 14)
+    infoLbl.BackgroundTransparency = 1
+    infoLbl.TextColor3 = TXTD
+    infoLbl.TextSize = SC(8, 9)
+    infoLbl.Font = Enum.Font.Gotham
+    infoLbl.LayoutOrder = nOrd()
+    table.insert(S.theme.textDim, infoLbl)
     
     local ub = Instance.new("TextButton", tM)
     ub.Text = "UNLOAD"
@@ -2628,4 +2580,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.8", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v17.9", "Loaded [Eclipse]. Tap X button to open menu.", 5)
