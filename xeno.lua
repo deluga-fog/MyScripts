@@ -152,15 +152,21 @@ end
 
 local function CopyDebugLog()
     local report = GetDebugReport()
+    -- Always print to console as reliable fallback
+    print(report)
+    
     if typeof(setclipboard) == "function" then
-        pcall(function()
+        local s, e = pcall(function()
             setclipboard(report)
         end)
-        Notify("DEBUG", "Log copied to clipboard!", 3)
+        if s then
+            Notify("DEBUG", "Log copied + Printed to console!", 3)
+        else
+            Notify("DEBUG", "Copy failed, check console (F9)!", 5)
+            warn("Clipboard error:", e)
+        end
     else
-        -- fallback: print to console
-        print(report)
-        Notify("DEBUG", "Log printed to console (no clipboard)", 3)
+        Notify("DEBUG", "Printed to console (no clipboard)", 3)
     end
 end
 
@@ -288,7 +294,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v17.7 [Eclipse]...", 3)
+Notify("XENO", "Loading v17.8 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -800,23 +806,22 @@ local function InstallSilentHooks()
     local hookSuccess, hookErr = pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            -- Stats (minimal overhead)
-            DebugLog.hookStats.totalCalls = DebugLog.hookStats.totalCalls + 1
-            DebugLog.hookStats.lastCallTime = tick()
-            
-            -- FAST PATH: exit if not WS or Cam
+            -- MEGA FAST PATH: 0.00001ms overhead
             if self ~= cachedWS and self ~= cachedCam then
                 return oldNc(self, ...)
             end
             
-            -- Track WS/Cam calls
+            if DEAD then return oldNc(self, ...) end
+
+            -- Stats only for relevant calls to save FPS
+            DebugLog.hookStats.totalCalls = DebugLog.hookStats.totalCalls + 1
+            DebugLog.hookStats.lastCallTime = tick()
+            
             if self == cachedWS then
                 DebugLog.hookStats.wsCalls = DebugLog.hookStats.wsCalls + 1
             else
                 DebugLog.hookStats.camCalls = DebugLog.hookStats.camCalls + 1
             end
-            
-            if DEAD then return oldNc(self, ...) end
             
             -- Check if anything is enabled
             local magicOn = S.magic.on
@@ -1672,7 +1677,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextLabel", main)
-    tl.Text = "XENO v17.7 [Eclipse]"
+    tl.Text = "XENO v17.8 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2216,6 +2221,9 @@ local function BuildGUI()
     db.LayoutOrder = nOrd()
     local dbc = Instance.new("UICorner", db)
     dbc.CornerRadius = UDim.new(0, 5)
+    db.Activated:Connect(function()
+        CopyDebugLog()
+    end)
     db.MouseButton1Click:Connect(function()
         CopyDebugLog()
     end)
@@ -2620,4 +2628,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.7", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v17.8", "Loaded [Eclipse]. Tap X button to open menu.", 5)
