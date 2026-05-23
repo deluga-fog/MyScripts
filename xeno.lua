@@ -9,7 +9,10 @@ local RunService = game:GetService("RunService")
 local WS         = game:GetService("Workspace")
 local StarterGui = game:GetService("StarterGui")
 local CoreGui    = game:GetService("CoreGui")
-local VIM        = game:GetService("VirtualInputManager")
+local VIM = nil
+pcall(function()
+    VIM = game:GetService("VirtualInputManager")
+end)
 
 local Plr   = Players.LocalPlayer
 local Cam   = WS.CurrentCamera
