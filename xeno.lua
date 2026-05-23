@@ -294,7 +294,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v17.9 [Eclipse]...", 3)
+Notify("XENO", "Loading v18.0 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -323,6 +323,9 @@ local Cfg = {
         On = false,
         MaxDist = 1500,
         ShowTeam = false,
+        UseVisColor = true, -- менять цвет если виден
+        VisibleColor = Color3.fromRGB(0, 255, 120), -- цвет когда виден
+        HiddenColor = Color3.fromRGB(255, 50, 50),  -- цвет когда за стеной
     },
     Box = {On = true, Style = "Corner", Thickness = 1, Outline = true, Color = Color3.fromRGB(255, 50, 50), TeamColor = Color3.fromRGB(50, 255, 50)},
     Name = {On = true, Size = 13, Format = "Name+Dist", Color = Color3.fromRGB(255, 255, 255), TeamColor = Color3.fromRGB(255, 255, 255)},
@@ -1030,6 +1033,13 @@ function E.Render(uid, ch, dname, isTeam)
         return
     end
     local head = ch:FindFirstChild("Head")
+    
+    -- VISIBLE COLOR LOGIC
+    local isVisible = false
+    if Cfg.ESP.UseVisColor then
+        isVisible = CanSee(head or rp, S.me.char)
+    end
+
     local topY = rpPos.Y + 3
     if head then topY = head.Position.Y + 1 end
     local botY = rpPos.Y - 3
@@ -1056,12 +1066,18 @@ function E.Render(uid, ch, dname, isTeam)
         E.Hide(o)
         return
     end
+
+    -- SELECT COLORS
     local boxClr = Cfg.Box.Color
     local nameClr = Cfg.Name.Color
-    if isTeam then
+    
+    if Cfg.ESP.UseVisColor then
+        boxClr = isVisible and Cfg.ESP.VisibleColor or Cfg.ESP.HiddenColor
+    elseif isTeam then
         boxClr = Cfg.Box.TeamColor
         nameClr = Cfg.Name.TeamColor
     end
+
     local distI = math.floor(dist)
 
     if Cfg.Box.On then
@@ -1330,7 +1346,7 @@ function HUD.Create()
     if S.draw.fov then
         pcall(function() 
             S.draw.fov.Filled = false
-            S.draw.fov.NumSides = 60
+            S.draw.fov.NumSides = 64
             S.draw.fov.Thickness = 1
         end)
     end
@@ -1348,6 +1364,18 @@ function HUD.Create()
             S.draw.st.Size = SC(14, 12)
             S.draw.st.Position = Vector2.new(10, SC(10, 40))
             S.draw.st.Visible = true
+        end)
+    end
+    -- FPS OVERLAY
+    S.draw.fps = ND("Text")
+    if S.draw.fps then
+        pcall(function()
+            S.draw.fps.Center = false
+            S.draw.fps.Outline = true
+            S.draw.fps.Size = 16
+            S.draw.fps.Position = Vector2.new(10, SC(60, 90))
+            S.draw.fps.Color = Color3.new(1, 1, 1)
+            S.draw.fps.Visible = true
         end)
     end
     S.draw.mb = ND("Text")
@@ -1381,10 +1409,21 @@ function HUD.Update()
             d.fov.Position = c
             d.fov.Radius = Cfg.Aim.FOV
             d.fov.Color = Cfg.UI.Accent
+            -- Force total transparency inside
             d.fov.Filled = false
-            d.fov.Transparency = 0.3
+            -- Fix for some executors that use Transparency for fill and line
+            d.fov.Transparency = 1 
             d.fov.Thickness = 1
             d.fov.Visible = Cfg.Aim.On and Cfg.Aim.FOVOn
+        end)
+    end
+    if d.fps then
+        pcall(function()
+            local fps = math.floor(S.fpsAvg + 0.5)
+            d.fps.Text = "FPS: " .. tostring(fps)
+            if fps > 50 then d.fps.Color = Color3.new(0, 1, 0.5)
+            elseif fps > 25 then d.fps.Color = Color3.new(1, 0.8, 0)
+            else d.fps.Color = Color3.new(1, 0.2, 0.2) end
         end)
     end
     if d.st then
@@ -1639,7 +1678,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextButton", main)
-    tl.Text = "XENO v17.9 [Eclipse]"
+    tl.Text = "XENO v18.0 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2118,12 +2157,13 @@ local function BuildGUI()
     mkSep(tE, "ESP")
     mkTog(tE, "Enabled", Cfg.ESP, "On", function(v) if not v then E.DelAll() end end)
     mkTog(tE, "Show Team", Cfg.ESP, "ShowTeam")
+    mkTog(tE, "Use Visible Color", Cfg.ESP, "UseVisColor") -- НОВАЯ!
     mkSld(tE, "Max Distance", 50, 3000, Cfg.ESP, "MaxDist", "%.0f")
     mkSep(tE, "BOX")
     mkTog(tE, "Box", Cfg.Box, "On")
     mkDD (tE, "Style", {"Corner", "Full"}, Cfg.Box, "Style")
     mkSld(tE, "Thickness", 0.5, 5, Cfg.Box, "Thickness", "%.1f")
-    mkTog(tE, "Outline", Cfg.Box, "Outline")
+    -- Удалил Outline настройку как просил
     mkSep(tE, "NAME")
     mkTog(tE, "Name Tag", Cfg.Name, "On")
     mkDD (tE, "Format", {"Name+Dist", "Name"}, Cfg.Name, "Format")
@@ -2195,6 +2235,12 @@ local function BuildGUI()
     db.MouseButton1Click:Connect(function()
         CopyDebugLog()
     end)
+    -- Самый надежный метод для мобилок/eclipse
+    db.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            CopyDebugLog()
+        end
+    end)
     
     -- Live stats removed for performance. Use the copy button.
     local infoLbl = Instance.new("TextLabel", tM)
@@ -2241,6 +2287,8 @@ local function BuildGUI()
     mkRGB(tC, "Toggle Off", Cfg.UI, "Toggle")
     mkRGB(tC, "Button Bad", Cfg.UI, "ButtonBad")
     mkSep(tC, "ESP COLORS")
+    mkRGB(tC, "Visible Color", Cfg.ESP, "VisibleColor")
+    mkRGB(tC, "Hidden Color",  Cfg.ESP, "HiddenColor")
     mkRGB(tC, "Enemy Box",  Cfg.Box,    "Color")
     mkRGB(tC, "Team Box",   Cfg.Box,    "TeamColor")
     mkRGB(tC, "Enemy Name", Cfg.Name,   "Color")
@@ -2580,4 +2628,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v17.9", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v18.0", "Loaded [Eclipse]. Tap X button to open menu.", 5)
