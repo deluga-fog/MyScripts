@@ -20,10 +20,12 @@ local function SC(p, m) if IsMobile then return m end return p end
 -- ---- Executor probe (Eclipse) ----
 local Exec = {name = "Eclipse", canSilent = false, canCoreGui = false, canClick = false}
 pcall(function()
-    if identifyexecutor then
+    if typeof(identifyexecutor) == "function" then
         Exec.name = identifyexecutor()
-    elseif getexecutorname then
+    elseif typeof(getexecutorname) == "function" then
         Exec.name = getexecutorname()
+    elseif typeof(identifyexecutor) == "string" then
+        Exec.name = identifyexecutor
     end
 end)
 pcall(function()
@@ -294,7 +296,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v18.0 [Eclipse]...", 3)
+Notify("XENO", "Loading v18.2 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -818,7 +820,7 @@ local function InstallSilentHooks()
                     if tp then
                         local d = (tp.Position - origin)
                         DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
-                        return oldNc(self, origin, d.Unit * dir.Magnitude, args[3])
+                        return oldNc(self, origin, d.Unit * dir.Magnitude, unpack(args, 3))
                     end
                 end
             elseif self == cachedCam and silentActive then
