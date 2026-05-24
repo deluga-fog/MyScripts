@@ -80,7 +80,7 @@ end
 
 local function GetDebugReport()
     local lines = {}
-    table.insert(lines, "===== XENO v19.1 DEBUG REPORT =====")
+    table.insert(lines, "===== XENO v19.2 DEBUG REPORT =====")
     table.insert(lines, "Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
     table.insert(lines, "")
     
@@ -294,7 +294,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v19.0...", 3)
+Notify("XENO", "Loading v19.2...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -1025,6 +1025,29 @@ local function IsPlayerShooting()
     return (tick() - S.lastShootTime) < 0.15
 end
 
+-- Вычислить AIM POINT — точку в мире куда смотрит прицел камеры
+-- Это решает проблему параллакса: камера сбоку, но персонаж должен
+-- смотреть туда куда реально попадёт пуля
+local function GetAimPoint()
+    if not Cam then return nil end
+    local vp = Cam.ViewportSize
+    -- Луч из центра экрана (прицел)
+    local centerRay = Cam:ViewportPointToRay(vp.X / 2, vp.Y / 2)
+    -- Рейкастим чтобы найти точку попадания
+    _internalRaycast = true
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {S.me.char}
+    params.RespectCanCollide = false
+    local result = WS:Raycast(centerRay.Origin, centerRay.Direction * 2000, params)
+    _internalRaycast = false
+    if result then
+        return result.Position
+    end
+    -- Если ничего не попали — точка далеко по лучу
+    return centerRay.Origin + centerRay.Direction * 2000
+end
+
 local function TPFix()
     if not Cfg.TP.On then return end
     if Cfg.Spin.On then return end
@@ -1058,20 +1081,14 @@ local function TPFix()
         end
     end
     
-    -- Определяем ПОЛНОЕ направление (с Y для вертикали)
-    local targetDir3D = nil   -- полный вектор с Y
-    local targetDirFlat = nil -- горизонтальный (для yaw)
+    -- ============================================
+    -- КЛЮЧЕВАЯ ЛОГИКА: определяем куда должен смотреть персонаж
+    -- ============================================
+    local aimWorldPoint = nil -- точка в мире куда целиться
     
     if S.tgt.part and S.tgt.part.Parent then
-        -- Есть цель -> полный вектор К ЦЕЛИ
-        local dirToTarget = S.tgt.part.Position - S.me.root.Position
-        if dirToTarget.Magnitude > 0.01 then
-            targetDir3D = dirToTarget.Unit
-        end
-        local flat = Vector3.new(dirToTarget.X, 0, dirToTarget.Z)
-        if flat.Magnitude > 0.01 then
-            targetDirFlat = flat.Unit
-        end
+        -- Есть цель аимбота -> целимся прямо в неё
+        aimWorldPoint = S.tgt.part.Position
         
         -- Сброс при смене цели
         if S.tgt.part ~= S.tpLastTarget then
@@ -1079,13 +1096,11 @@ local function TPFix()
             S.tpLastTarget = S.tgt.part
         end
     elseif Cfg.TP.AlwaysAlign then
-        -- Нет цели -> выравниваем по камере (включая pitch)
-        local camLook = Cam.CFrame.LookVector
-        targetDir3D = camLook
-        local flat = Vector3.new(camLook.X, 0, camLook.Z)
-        if flat.Magnitude > 0.01 then
-            targetDirFlat = flat.Unit
-        end
+        -- Нет цели -> находим AIM POINT через рейкаст из центра экрана
+        -- Это решает проблему параллакса!
+        -- Камера может быть сбоку, но мы находим ТОЧКУ куда смотрит прицел
+        -- и поворачиваем персонажа к ЭТОЙ ТОЧКЕ
+        aimWorldPoint = GetAimPoint()
         S.tpLastTarget = nil
     else
         S.tpRot = 0
@@ -1094,7 +1109,18 @@ local function TPFix()
         return
     end
     
-    if not targetDirFlat then return end
+    if not aimWorldPoint then return end
+    
+    -- Вычисляем направление ОТ ПЕРСОНАЖА к aim point
+    -- Это компенсирует offset камеры (параллакс)
+    local rootPos = S.me.root.Position
+    local dirFromRoot = aimWorldPoint - rootPos
+    if dirFromRoot.Magnitude < 0.1 then return end
+    
+    -- Flat direction для проверки угла
+    local flatDir = Vector3.new(dirFromRoot.X, 0, dirFromRoot.Z)
+    if flatDir.Magnitude < 0.01 then return end
+    local targetDirFlat = flatDir.Unit
     
     -- Сброс при резком изменении направления
     if S.tpLastDir then
@@ -1104,7 +1130,7 @@ local function TPFix()
     end
     S.tpLastDir = targetDirFlat
     
-    -- Угол между текущим и целевым (горизонтальный)
+    -- Угол между текущим направлением персонажа и целевым
     local charLook = S.me.root.CFrame.LookVector
     local flatChar = Vector3.new(charLook.X, 0, charLook.Z)
     if flatChar.Magnitude < 0.01 then return end
@@ -1114,46 +1140,40 @@ local function TPFix()
     local angle = math.deg(math.acos(math.clamp(dotProduct, -1, 1)))
     
     if angle > Cfg.TP.MaxAngle then return end
-    if angle < 0.5 then
+    
+    -- Уже выровнены? (проверяем и горизонт и вертикаль)
+    local fullDir = dirFromRoot.Unit
+    local charFull = S.me.root.CFrame.LookVector
+    local fullDot = charFull:Dot(fullDir)
+    if fullDot > 0.999 then
         S.tpRot = 1
         return
     end
     
-    -- Целевой CFrame: ПОЛНЫЙ lookAt с Y-компонентой
-    -- Это даёт и yaw (горизонт) и pitch (верх/низ)
-    local lookTarget
-    if targetDir3D then
-        lookTarget = S.me.root.Position + targetDir3D
-    else
-        lookTarget = S.me.root.Position + targetDirFlat
-    end
-    
-    local targetCF = CFrame.lookAt(S.me.root.Position, lookTarget)
+    -- Целевой CFrame: lookAt от рута к aim point (полный 3D с pitch)
+    local targetCF = CFrame.lookAt(rootPos, aimWorldPoint)
     
     -- InstantSnap
     if Cfg.TP.InstantSnap then
-        -- Извлекаем pitch и yaw
-        local pitch, yaw, _ = targetCF:ToEulerAnglesYXZ()
         pcall(function()
-            S.me.root.CFrame = CFrame.new(S.me.root.Position) 
-                * CFrame.Angles(0, yaw, 0)  -- горизонт
-                * CFrame.Angles(pitch, 0, 0)  -- вертикаль
+            -- Сохраняем позицию, ставим полный поворот
+            S.me.root.CFrame = CFrame.new(rootPos) * (targetCF - targetCF.Position)
         end)
         S.tpRot = 1
         return
     end
     
     -- Плавная интерполяция
-    local speedMult = math.clamp(angle / 45, 0.5, 2)
+    local speedMult = math.clamp(angle / 30, 0.5, 3)
     S.tpRot = math.min(S.tpRot + Cfg.TP.RotSpeed * speedMult, 1)
     
-    local interpCF = S.me.root.CFrame:Lerp(targetCF, S.tpRot)
-    local pitch, yaw, _ = interpCF:ToEulerAnglesYXZ()
+    -- Интерполируем rotation часть CFrame
+    local currentCF = S.me.root.CFrame
+    local interpCF = currentCF:Lerp(targetCF, S.tpRot)
     
     pcall(function()
-        S.me.root.CFrame = CFrame.new(S.me.root.Position) 
-            * CFrame.Angles(0, yaw, 0)
-            * CFrame.Angles(pitch, 0, 0)
+        -- Сохраняем позицию, берём rotation из интерполированного
+        S.me.root.CFrame = CFrame.new(rootPos) * (interpCF - interpCF.Position)
     end)
 end
 
@@ -1977,7 +1997,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextButton", main)
-    tl.Text = "XENO v19.0"
+    tl.Text = "XENO v19.2"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2832,5 +2852,5 @@ end
 BuildGUI()
 MainLoop()
 
-Notify("XENO v19.0", "Loaded! Tap X to open menu.", 5)
+Notify("XENO v19.2", "Loaded! Tap X to open menu.", 5)
 Log("INIT", "Script fully loaded")
