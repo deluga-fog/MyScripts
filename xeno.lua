@@ -80,7 +80,7 @@ end
 
 local function GetDebugReport()
     local lines = {}
-    table.insert(lines, "===== XENO v19.0 DEBUG REPORT =====")
+    table.insert(lines, "===== XENO v19.1 DEBUG REPORT =====")
     table.insert(lines, "Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
     table.insert(lines, "")
     
@@ -115,8 +115,7 @@ local function GetDebugReport()
     table.insert(lines, "-- CONFIG STATE --")
     table.insert(lines, "Aim.On: " .. tostring(Cfg.Aim.On))
     table.insert(lines, "Aim.Mode: " .. tostring(Cfg.Aim.Mode))
-    table.insert(lines, "MagicBullet.On: " .. tostring(Cfg.MagicBullet.On))
-    table.insert(lines, "S.magic.on: " .. tostring(S.magic.on))
+    table.insert(lines, "Silent hooks installed: " .. tostring(S.magic.hookInstalled))
     table.insert(lines, "S.magic.hookInstalled: " .. tostring(S.magic.hookInstalled))
     table.insert(lines, "")
     
@@ -359,7 +358,7 @@ local Cfg = {
     },
     Checks = {Team = true, Wall = true},
     Limits = {MaxDist = 800, MaxAngle = 90, MinDist = 5},
-    MagicBullet = {On = false, Range = 300},
+
     Tick = {ESP = SC(3, 6), WH = SC(5, 10), HUD = SC(2, 3), Aim = 1},
     UI = {
         Accent     = Color3.fromRGB(90, 130, 255),
@@ -774,12 +773,10 @@ local function InstallSilentHooks()
     -- Хелпер: проверить нужно ли перенаправлять (inline, без вызова функций)
     local function quickCheck()
         if DEAD then return false, nil, nil end
-        local silentOk = Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
-        local magicOk = S.magic.on
-        if not silentOk and not magicOk then return false, nil, nil end
+        if not Cfg.Aim.On or Cfg.Aim.Mode ~= "Silent" then return false, nil, nil end
         local p = S.tgt.part
         if not p or not p.Parent then return false, nil, nil end
-        if silentOk and not S.tgt.vis then return false, nil, nil end
+        if not S.tgt.vis then return false, nil, nil end
         local tp = PredPos(p)
         return true, p, tp
     end
@@ -997,17 +994,7 @@ local function InstallSilentHooks()
     end
 end
 
-local function ToggleMagicBullet()
-    Log("MAGIC", "Toggle called, current: " .. tostring(S.magic.on))
-    S.magic.on = not S.magic.on
-    Cfg.MagicBullet.On = S.magic.on
-    Log("MAGIC", "New state: " .. tostring(S.magic.on))
-    if S.magic.on and not S.magic.hookInstalled then 
-        Log("MAGIC", "Installing hooks...")
-        InstallSilentHooks() 
-    end
-    if not S.magic.on then S.magic.target = nil end
-end
+
 
 -- Install hooks when Silent mode is selected
 local function OnAimModeChanged(mode)
@@ -1040,8 +1027,6 @@ end
 
 local function TPFix()
     if not Cfg.TP.On then return end
-    
-    -- Конфликт со SpinBot — SpinBot приоритетнее
     if Cfg.Spin.On then return end
     
     if not S.me.alive or not S.me.root or not S.me.root.Parent then
@@ -1052,129 +1037,123 @@ local function TPFix()
     end
     if not Cam then return end
     
-    -- Определяем, находимся ли мы в 3rd person
-    -- (расстояние камеры до рута > 1 stud = 3rd person)
+    -- Определяем 3rd person (камера > 1 stud от рута)
     local camToRoot = (S.me.root.Position - Cam.CFrame.Position).Magnitude
     if camToRoot < 1 then
-        -- 1st person, не нужен фикс
         S.tpRot = 0
         S.tpLastDir = nil
         return
     end
-    
-    -- Проверяем лимит расстояния камеры (настраиваемый)
     if camToRoot > Cfg.TP.CamDist then
         S.tpRot = 0
         S.tpLastDir = nil
         return
     end
     
-    -- Режим OnlyOnShoot: поворачиваем только когда стреляем
+    -- OnlyOnShoot: поворачиваем только при стрельбе
     if Cfg.TP.OnlyOnShoot then
         if not IsPlayerShooting() then
-            -- Не стреляем — сбрасываем интерполяцию для следующего раза
             S.tpRot = 0
             return
         end
     end
     
-    -- Определяем направление, куда поворачивать персонажа
-    local targetDir = nil
-    local targetChanged = false
+    -- Определяем ПОЛНОЕ направление (с Y для вертикали)
+    local targetDir3D = nil   -- полный вектор с Y
+    local targetDirFlat = nil -- горизонтальный (для yaw)
     
     if S.tgt.part and S.tgt.part.Parent then
-        -- Есть цель аимбота -> поворачиваем к цели
+        -- Есть цель -> полный вектор К ЦЕЛИ
         local dirToTarget = S.tgt.part.Position - S.me.root.Position
-        local flatDir = Vector3.new(dirToTarget.X, 0, dirToTarget.Z)
-        if flatDir.Magnitude > 0.01 then
-            targetDir = flatDir.Unit
+        if dirToTarget.Magnitude > 0.01 then
+            targetDir3D = dirToTarget.Unit
+        end
+        local flat = Vector3.new(dirToTarget.X, 0, dirToTarget.Z)
+        if flat.Magnitude > 0.01 then
+            targetDirFlat = flat.Unit
         end
         
-        -- Сброс интерполяции при смене цели
+        -- Сброс при смене цели
         if S.tgt.part ~= S.tpLastTarget then
             S.tpRot = 0
             S.tpLastTarget = S.tgt.part
-            targetChanged = true
         end
     elseif Cfg.TP.AlwaysAlign then
-        -- Нет цели, но AlwaysAlign включён -> выравниваем по камере
+        -- Нет цели -> выравниваем по камере (включая pitch)
         local camLook = Cam.CFrame.LookVector
-        local flatCam = Vector3.new(camLook.X, 0, camLook.Z)
-        if flatCam.Magnitude > 0.01 then
-            targetDir = flatCam.Unit
+        targetDir3D = camLook
+        local flat = Vector3.new(camLook.X, 0, camLook.Z)
+        if flat.Magnitude > 0.01 then
+            targetDirFlat = flat.Unit
         end
         S.tpLastTarget = nil
     else
-        -- Нет цели и AlwaysAlign выключен -> ничего не делаем
         S.tpRot = 0
         S.tpLastTarget = nil
         S.tpLastDir = nil
         return
     end
     
-    if not targetDir then return end
+    if not targetDirFlat then return end
     
-    -- Проверяем, сильно ли изменилось направление (для сброса интерполяции)
+    -- Сброс при резком изменении направления
     if S.tpLastDir then
-        local dirChange = targetDir:Dot(S.tpLastDir)
-        if dirChange < 0.7 then -- больше ~45 градусов изменение
+        if targetDirFlat:Dot(S.tpLastDir) < 0.7 then
             S.tpRot = 0
-            targetChanged = true
         end
     end
-    S.tpLastDir = targetDir
+    S.tpLastDir = targetDirFlat
     
-    -- Вычисляем текущее направление персонажа (flat, без Y)
+    -- Угол между текущим и целевым (горизонтальный)
     local charLook = S.me.root.CFrame.LookVector
     local flatChar = Vector3.new(charLook.X, 0, charLook.Z)
     if flatChar.Magnitude < 0.01 then return end
     flatChar = flatChar.Unit
     
-    -- Проверяем угол между текущим направлением и целевым
-    local dotProduct = flatChar:Dot(targetDir)
+    local dotProduct = flatChar:Dot(targetDirFlat)
     local angle = math.deg(math.acos(math.clamp(dotProduct, -1, 1)))
     
-    -- Проверка MaxAngle
-    if angle > Cfg.TP.MaxAngle then
-        -- Угол слишком большой, ограничиваем поворот
-        -- (можно либо не поворачивать, либо поворачивать на MaxAngle)
-        -- Пока просто не поворачиваем если угол > MaxAngle
-        return
-    end
-    
-    -- Уже смотрим в нужном направлении?
+    if angle > Cfg.TP.MaxAngle then return end
     if angle < 0.5 then
-        S.tpRot = 1 -- помечаем что выровнены
+        S.tpRot = 1
         return
     end
     
-    -- Целевой CFrame (только yaw, сохраняем позицию)
-    local targetCF = CFrame.lookAt(
-        S.me.root.Position, 
-        S.me.root.Position + targetDir
-    )
+    -- Целевой CFrame: ПОЛНЫЙ lookAt с Y-компонентой
+    -- Это даёт и yaw (горизонт) и pitch (верх/низ)
+    local lookTarget
+    if targetDir3D then
+        lookTarget = S.me.root.Position + targetDir3D
+    else
+        lookTarget = S.me.root.Position + targetDirFlat
+    end
     
-    -- Режим InstantSnap: мгновенный поворот
+    local targetCF = CFrame.lookAt(S.me.root.Position, lookTarget)
+    
+    -- InstantSnap
     if Cfg.TP.InstantSnap then
-        local _, yaw, _ = targetCF:ToEulerAnglesYXZ()
+        -- Извлекаем pitch и yaw
+        local pitch, yaw, _ = targetCF:ToEulerAnglesYXZ()
         pcall(function()
-            S.me.root.CFrame = CFrame.new(S.me.root.Position) * CFrame.Angles(0, yaw, 0)
+            S.me.root.CFrame = CFrame.new(S.me.root.Position) 
+                * CFrame.Angles(0, yaw, 0)  -- горизонт
+                * CFrame.Angles(pitch, 0, 0)  -- вертикаль
         end)
         S.tpRot = 1
         return
     end
     
     -- Плавная интерполяция
-    -- Используем скорость зависящую от угла — чем больше угол, тем быстрее
     local speedMult = math.clamp(angle / 45, 0.5, 2)
     S.tpRot = math.min(S.tpRot + Cfg.TP.RotSpeed * speedMult, 1)
     
-    -- Извлекаем только yaw из интерполированного CFrame
     local interpCF = S.me.root.CFrame:Lerp(targetCF, S.tpRot)
-    local _, yaw, _ = interpCF:ToEulerAnglesYXZ()
+    local pitch, yaw, _ = interpCF:ToEulerAnglesYXZ()
     
     pcall(function()
-        S.me.root.CFrame = CFrame.new(S.me.root.Position) * CFrame.Angles(0, yaw, 0)
+        S.me.root.CFrame = CFrame.new(S.me.root.Position) 
+            * CFrame.Angles(0, yaw, 0)
+            * CFrame.Angles(pitch, 0, 0)
     end)
 end
 
@@ -1726,14 +1705,7 @@ function HUD.Update()
         end)
     end
     if d.mb then
-        if S.magic.on then
-            pcall(function()
-                d.mb.Text = "MAGIC BULLET ON"
-                d.mb.Visible = true
-            end)
-        else
-            pcall(function() d.mb.Visible = false end)
-        end
+        pcall(function() d.mb.Visible = false end)
     end
     if d.tb then
         if Cfg.TriggerBot.On then
@@ -1756,7 +1728,7 @@ function HUD.Update()
     end
     -- HOOKS INDICATOR
     if d.hooks then
-        local showHooks = S.magic.hookInstalled and (S.magic.on or Cfg.Aim.Mode == "Silent")
+        local showHooks = S.magic.hookInstalled and Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
         if showHooks then
             local redirects = DebugLog.hookStats.redirects
             local lastRedirect = DebugLog.hookStats.lastRedirectTick or 0
@@ -1777,15 +1749,11 @@ function HUD.Update()
             pcall(function() d.hooks.Visible = false end)
         end
     end
-    -- SILENT/MAGIC STATUS LINE
+    -- SILENT STATUS LINE
     if d.silentSt then
         local isSilent = Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
-        local isMagic = S.magic.on
-        if isSilent or isMagic then
-            local parts = {}
-            if isSilent then table.insert(parts, "SILENT") end
-            if isMagic then table.insert(parts, "MAGIC") end
-            local status = table.concat(parts, "+")
+        if isSilent then
+            local status = "SILENT"
             if S.tgt.part then
                 status = status .. " -> " .. (S.tgt.name ~= "" and S.tgt.name or "target")
             else
@@ -2025,18 +1993,6 @@ local function BuildGUI()
     tl.Activated:Connect(function()
         CopyDebugLog()
     end)
-
-    local perfBtn = Instance.new("TextButton", main)
-    perfBtn.Text = "P"
-    perfBtn.Size = UDim2.new(0, 24, 0, 24)
-    perfBtn.Position = UDim2.new(1, -60, 0, 4)
-    perfBtn.BackgroundColor3 = Color3.fromRGB(60, 80, 140)
-    perfBtn.TextColor3 = Color3.new(1, 1, 1)
-    perfBtn.TextSize = SC(14, 12)
-    perfBtn.Font = Enum.Font.GothamBold
-    perfBtn.AutoButtonColor = false
-    local pbc = Instance.new("UICorner", perfBtn)
-    pbc.CornerRadius = UDim.new(0, 5)
 
     local xb = Instance.new("TextButton", main)
     xb.Text = "X"
@@ -2443,13 +2399,12 @@ local function BuildGUI()
         end)
     end
 
-    local tA  = mkTab("AIM",    1, 7)
-    local tE  = mkTab("ESP",    2, 7)
-    local tW  = mkTab("WH",     3, 7)
-    local tM  = mkTab("MISC",   4, 7)
-    local tMB = mkTab("MAGIC",  5, 7)
-    local tC  = mkTab("COLORS", 6, 7)
-    local tT  = mkTab("PERF",   7, 7)
+    local tA  = mkTab("AIM",    1, 6)
+    local tE  = mkTab("ESP",    2, 6)
+    local tW  = mkTab("WH",     3, 6)
+    local tM  = mkTab("MISC",   4, 6)
+    local tC  = mkTab("COLORS", 5, 6)
+    local tT  = mkTab("PERF",   6, 6)
     tabBtns["AIM"].TextColor3 = MC
     tA.Visible = true
     curTab = tA
@@ -2600,13 +2555,7 @@ local function BuildGUI()
     task.delay(0.3, Cleanup) end)
     table.insert(S.theme.btnBad, ub)
 
-    -- MAGIC BULLET TAB
-    ord = 0
-    mkSep(tMB, "MAGIC BULLET")
-    mkTog(tMB, "Enabled", Cfg.MagicBullet, "On", function(v)
-        if v ~= S.magic.on then ToggleMagicBullet() end
-    end)
-    mkSld(tMB, "Max Range", 50, 500, Cfg.MagicBullet, "Range", "%.0f")
+
 
     -- COLORS TAB
     ord = 0
@@ -2733,96 +2682,6 @@ local function BuildGUI()
     S.draw.fpsLbl = fpsLbl
     S.draw.activeLbl = activeLbl
 
-    -- ==== PERF POPOVER ====
-    local pop = Instance.new("Frame", gui)
-    pop.Size = UDim2.new(0, 200, 0, 140)
-    pop.Position = UDim2.new(1, -210, 0, SC(50, 50))
-    pop.BackgroundColor3 = Cfg.UI.Background
-    pop.BorderSizePixel = 0
-    pop.Visible = false
-    pop.ZIndex = 50
-    local popc = Instance.new("UICorner", pop)
-    popc.CornerRadius = UDim.new(0, 6)
-    local pops = Instance.new("UIStroke", pop)
-    pops.Color = Cfg.UI.Accent
-    table.insert(S.theme.bg, pop)
-    local ptitle = Instance.new("TextLabel", pop)
-    ptitle.Text = "QUICK TICK"
-    ptitle.Size = UDim2.new(1, 0, 0, 18)
-    ptitle.BackgroundTransparency = 1
-    ptitle.TextColor3 = Cfg.UI.Accent
-    ptitle.Font = Enum.Font.GothamBold
-    ptitle.TextSize = SC(11, 11)
-    ptitle.ZIndex = 51
-    table.insert(S.theme.accent, {obj = ptitle, prop = "TextColor3"})
-    local function quickRow(yOff, lab, key, mx)
-        local row = Instance.new("Frame", pop)
-        row.Size = UDim2.new(1, -10, 0, 28)
-        row.Position = UDim2.new(0, 5, 0, yOff)
-        row.BackgroundColor3 = Cfg.UI.Panel
-        row.BorderSizePixel = 0
-        row.ZIndex = 51
-        local rc = Instance.new("UICorner", row)
-        rc.CornerRadius = UDim.new(0, 4)
-        table.insert(S.theme.panel, row)
-        local lbl = Instance.new("TextLabel", row)
-        lbl.Text = lab .. ": " .. Cfg.Tick[key]
-        lbl.Size = UDim2.new(0.55, 0, 1, 0)
-        lbl.Position = UDim2.new(0, 6, 0, 0)
-        lbl.BackgroundTransparency = 1
-        lbl.TextColor3 = Cfg.UI.Text
-        lbl.Font = Enum.Font.Code
-        lbl.TextSize = SC(10, 10)
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.ZIndex = 52
-        table.insert(S.theme.text, lbl)
-        local mn = Instance.new("TextButton", row)
-        mn.Text = "-"
-        mn.Size = UDim2.new(0, 22, 0, 22)
-        mn.Position = UDim2.new(1, -52, 0.5, -11)
-        mn.BackgroundColor3 = Cfg.UI.Toggle
-        mn.TextColor3 = Cfg.UI.Text
-        mn.Font = Enum.Font.GothamBold
-        mn.TextSize = SC(14, 14)
-        mn.ZIndex = 52
-        local mnc = Instance.new("UICorner", mn)
-        mnc.CornerRadius = UDim.new(0, 4)
-        local pl = Instance.new("TextButton", row)
-        pl.Text = "+"
-        pl.Size = UDim2.new(0, 22, 0, 22)
-        pl.Position = UDim2.new(1, -26, 0.5, -11)
-        pl.BackgroundColor3 = Cfg.UI.Accent
-        pl.TextColor3 = Color3.new(1, 1, 1)
-        pl.Font = Enum.Font.GothamBold
-        pl.TextSize = SC(14, 14)
-        pl.ZIndex = 52
-        local plc = Instance.new("UICorner", pl)
-        plc.CornerRadius = UDim.new(0, 4)
-        table.insert(S.theme.accent, {obj = pl, prop = "BackgroundColor3"})
-        local function refresh() lbl.Text = lab .. ": " .. Cfg.Tick[key] end
-        mn.MouseButton1Click:Connect(function() Cfg.Tick[key] = math.max(Cfg.Tick[key] - 1, 1)
-        refresh() end)
-        pl.MouseButton1Click:Connect(function() Cfg.Tick[key] = math.min(Cfg.Tick[key] + 1, mx)
-        refresh() end)
-    end
-    quickRow(22, "ESP", "ESP", 30)
-    quickRow(54, "WH",  "WH",  60)
-    quickRow(86, "HUD", "HUD", 10)
-    local popClose = Instance.new("TextButton", pop)
-    popClose.Text = "CLOSE"
-    popClose.Size = UDim2.new(1, -10, 0, 22)
-    popClose.Position = UDim2.new(0, 5, 1, -26)
-    popClose.BackgroundColor3 = Cfg.UI.ButtonBad
-    popClose.TextColor3 = Color3.new(1, 1, 1)
-    popClose.Font = Enum.Font.GothamBold
-    popClose.TextSize = SC(10, 10)
-    popClose.ZIndex = 52
-    local pcc = Instance.new("UICorner", popClose)
-    pcc.CornerRadius = UDim.new(0, 4)
-    popClose.MouseButton1Click:Connect(function() pop.Visible = false end)
-    table.insert(S.theme.btnBad, popClose)
-    perfBtn.MouseButton1Click:Connect(function() pop.Visible = not pop.Visible end)
-
     -- ==== FLOATING BUTTON ====
     local obs = SC(36, 44)
     local ob = Instance.new("TextButton", gui)
@@ -2893,7 +2752,7 @@ local function MainLoop()
         if aimRate < 1 then aimRate = 1 end
         if S.frame % aimRate == 0 then
             -- Ищем таргет если аимбот ВКЛ или Magic Bullet ВКЛ
-            local needTarget = (Cfg.Aim.On or S.magic.on) and S.me.alive and S.me.root
+            local needTarget = Cfg.Aim.On and S.me.alive and S.me.root
             if needTarget then
                 local part, plr = FindTarget()
                 if part then
@@ -2965,7 +2824,7 @@ task.wait(0.5)
 HUD.Create()
 
 -- Устанавливаем хуки при загрузке если Silent режим выбран или Magic Bullet включён
-if Exec.canSilent and (Cfg.Aim.Mode == "Silent" or Cfg.MagicBullet.On) then
+if Exec.canSilent and Cfg.Aim.Mode == "Silent" then
     Log("INIT", "Pre-installing hooks (Silent/Magic enabled)")
     InstallSilentHooks()
 end
