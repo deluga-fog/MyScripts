@@ -210,40 +210,67 @@ end
 
 -- ---- Click helpers (for TriggerBot) ----
 local ClickMethod = "none"
+local ClickFallback = nil  -- фоллбэк метод для мобилки
 local function InitClickMethod()
-    -- try mouse1press first (most common)
+    -- На мобилке: Tool:Activate() — не прерывает джойстик!
+    if IsMobile then
+        ClickMethod = "tool"
+        ClickFallback = nil
+        -- Сохраняем фоллбэк на случай если нет тула
+        if typeof(mouse1press) == "function" then
+            ClickFallback = "mouse1press"
+        end
+        pcall(function()
+            if VIM and VIM:IsA("VirtualInputManager") then
+                ClickFallback = ClickFallback or "vim"
+            end
+        end)
+        Exec.canClick = true
+        return
+    end
+    
+    -- ПК: mouse1press (стандарт)
     if typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
         local ok = pcall(function()
-            -- test if it works without crashing
             return mouse1press and mouse1release
         end)
         if ok then
             ClickMethod = "mouse1press"
+            Exec.canClick = true
             return
         end
     end
-    -- try VirtualInputManager
+    -- VirtualInputManager (фоллбэк ПК)
     if VIM and typeof(VIM) == "Instance" then
         local ok = pcall(function()
             return VIM:IsA("VirtualInputManager")
         end)
         if ok then
             ClickMethod = "vim"
+            Exec.canClick = true
             return
         end
     end
-    -- try getting VIM differently
     pcall(function()
         local vim2 = game:GetService("VirtualInputManager")
         if vim2 then
             VIM = vim2
             ClickMethod = "vim"
+            Exec.canClick = true
         end
     end)
-    if ClickMethod ~= "none" then return end
-    -- no click method available
-    ClickMethod = "none"
-    Exec.canClick = false
+    if ClickMethod == "none" then
+        Exec.canClick = false
+    end
+end
+
+-- Получить Tool (оружие) из рук персонажа
+local function GetTool()
+    if not S.me.char then return nil end
+    for _, c in ipairs(S.me.char:GetChildren()) do
+        if c:IsA("Tool") then return c end
+    end
+    return nil
 end
 
 local function DoClick()
@@ -251,6 +278,36 @@ local function DoClick()
     
     local success = false
     
+    -- ПРИОРИТЕТ 1: Tool:Activate() — не прерывает сенсор на мобилке!
+    if ClickMethod == "tool" then
+        local tool = GetTool()
+        if tool then
+            local ok = pcall(function()
+                tool:Activate()
+            end)
+            if ok then
+                success = true
+            end
+            -- Если Activate не сработал — фоллбэк
+            if not success and ClickFallback then
+                ClickMethod = ClickFallback
+                local res = DoClick()
+                ClickMethod = "tool" -- вернуть обратно
+                return res
+            end
+        else
+            -- Нет оружия в руках — фоллбэк
+            if ClickFallback then
+                ClickMethod = ClickFallback
+                local res = DoClick()
+                ClickMethod = "tool" -- вернуть обратно
+                return res
+            end
+        end
+        return success
+    end
+    
+    -- ПРИОРИТЕТ 2: mouse1press (ПК)
     if ClickMethod == "mouse1press" then
         local ok1 = pcall(function()
             mouse1press()
@@ -263,10 +320,11 @@ local function DoClick()
                 end)
             end)
         else
-            -- method failed, disable it
             ClickMethod = "none"
             Exec.canClick = false
         end
+    
+    -- ПРИОРИТЕТ 3: VirtualInputManager (фоллбэк)
     elseif ClickMethod == "vim" then
         local ok1 = pcall(function()
             VIM:SendMouseButtonEvent(0, 0, 0, true, game, 1)
@@ -279,7 +337,6 @@ local function DoClick()
                 end)
             end)
         else
-            -- method failed, disable it
             ClickMethod = "none"
             Exec.canClick = false
         end
@@ -318,6 +375,7 @@ local Cfg = {
         BurstCount = 1,     -- количество кликов за раз
         BurstDelay = 0.02,  -- задержка между кликами в burst
         OnlyADS = false,    -- только когда зумишь (RMB)
+        TBFOV = 60,         -- радиус в пикселях от центра экрана для срабатывания
     },
     ESP = {
         On = false,
@@ -682,45 +740,64 @@ end
 
 -- ---- Trigger Bot ----
 local function UpdateTriggerBot()
-    -- safety checks
     if DEAD then return end
     if not Cfg.TriggerBot.On then return end
     if ClickMethod == "none" then return end
-    if not Cfg.Aim.On then return end
-    if not S.tgt.part or not S.tgt.vis then return end
     if not S.me.alive then return end
     
-    -- check ADS if required
+    -- ADS check
     if Cfg.TriggerBot.OnlyADS then
         local ok, rmb = pcall(function()
             return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
         end)
-        -- if check fails (mobile server), skip ADS requirement
         if ok and not rmb then return end
     end
     
-    -- check if target is actually on screen center (within small threshold)
-    local sp, on = W2S(S.tgt.part.Position)
-    if not sp or not on then return end
+    -- Ищем врага в TB FOV (независимо от аимбота!)
+    -- Сканируем всех игроков, проверяем попадает ли голова в TB FOV
     local center = ScrC()
-    local distToCenter = (sp - center).Magnitude
+    local tbFOV = Cfg.TriggerBot.TBFOV
+    local bestDist = tbFOV
+    local foundTarget = false
     
-    -- trigger only if crosshair is close to target (within ~30px)
-    local threshold = 30
-    if distToCenter > threshold then return end
+    for _, tp in ipairs(S.plList) do
+        if tp == Plr then continue end
+        local ch = tp.Character
+        if not ch or not ch.Parent then continue end
+        if Cfg.Checks.Team and TeamEq(Plr, tp) then continue end
+        if GetHP(ch) <= 0 then continue end
+        
+        -- Проверяем все хитбоксы: Head, UpperTorso, HumanoidRootPart
+        for _, partName in ipairs({"Head", "UpperTorso", "HumanoidRootPart"}) do
+            local part = ch:FindFirstChild(partName)
+            if not part then continue end
+            
+            local sp, on = W2S(part.Position)
+            if not sp or not on then continue end
+            
+            local distToCenter = (sp - center).Magnitude
+            if distToCenter < bestDist then
+                -- Wall check (опционально)
+                if Cfg.Checks.Wall and not CanSee(part, S.me.char) then continue end
+                bestDist = distToCenter
+                foundTarget = true
+            end
+        end
+    end
     
-    -- check delay
+    if not foundTarget then return end
+    
+    -- Check delay
     local now = tick()
     if now - S.trigger.lastShot < Cfg.TriggerBot.Delay then return end
     
-    -- fire!
+    -- Fire!
     S.trigger.lastShot = now
     local burstCount = math.clamp(Cfg.TriggerBot.BurstCount, 1, 10)
     
     if burstCount == 1 then
         local ok = DoClick()
         if not ok then
-            -- click failed, disable triggerbot
             Cfg.TriggerBot.On = false
         end
     else
@@ -2450,6 +2527,7 @@ local function BuildGUI()
     mkSld(tA, "Pred Factor", 0.05, 0.5, Cfg.Aim, "PredFactor", "%.2f")
     mkSep(tA, "TRIGGER BOT")
     mkTog(tA, "Trigger Bot", Cfg.TriggerBot, "On")
+    mkSld(tA, "TB FOV (px)", 10, 200, Cfg.TriggerBot, "TBFOV", "%.0f")
     mkSld(tA, "Shot Delay", 0.01, 0.5, Cfg.TriggerBot, "Delay", "%.2f")
     mkSld(tA, "Burst Count", 1, 10, Cfg.TriggerBot, "BurstCount", "%.0f")
     mkSld(tA, "Burst Delay", 0.01, 0.1, Cfg.TriggerBot, "BurstDelay", "%.2f")
