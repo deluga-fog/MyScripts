@@ -79,7 +79,7 @@ end
 
 local function GetDebugReport()
     local lines = {}
-    table.insert(lines, "===== XENO v17.7 DEBUG REPORT =====")
+    table.insert(lines, "===== XENO v18.2 DEBUG REPORT =====")
     table.insert(lines, "Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
     table.insert(lines, "")
     
@@ -294,7 +294,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v18.0 [Eclipse]...", 3)
+Notify("XENO", "Loading v18.2 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -341,7 +341,15 @@ local Cfg = {
         TeamFill = Color3.fromRGB(0, 255, 0),
         TeamLine = Color3.fromRGB(255, 255, 255),
     },
-    TP = {On = false, RotSpeed = 0.3, MaxAngle = 45},
+    TP = {
+        On = false, 
+        RotSpeed = 0.3, 
+        MaxAngle = 180,      -- максимальный угол поворота
+        CamDist = 50,        -- макс дистанция камеры
+        AlwaysAlign = false, -- выравнивать всегда или только при стрельбе
+        OnlyOnShoot = true,  -- поворачивать ТОЛЬКО когда стреляешь (LMB)
+        InstantSnap = false, -- мгновенный поворот вместо плавного
+    },
     Spin = {On = false, Spd = 10},
     Speed = {
         On = false,
@@ -382,10 +390,14 @@ local S = {
     plList = {},
     plTick = 0,
     tpRot = 0,
+    tpLastTarget = nil,  -- track target changes for reset
+    tpLastDir = nil,     -- last target direction for smooth transition
     spinAng = 0,
     fpsAvg = 60,
     fpsLast = tick(),
     moveDir = Vector3.zero,
+    isShooting = false,  -- track if player is currently shooting (LMB held)
+    lastShootTime = 0,   -- last time player shot (for OnlyOnShoot mode)
 }
 
 -- ---- Geometry helpers ----
@@ -468,6 +480,7 @@ local function SetupChar()
         S.tgt.part = nil
         S.tgt.plr = nil
         S.tpRot = 0
+        S.tpLastTarget = nil
         -- cleanup old speed hack objects
         if S.speed.bodyVel then
             pcall(function() S.speed.bodyVel:Destroy() end)
@@ -500,13 +513,12 @@ local function SetupChar()
             S.tgt.part = nil
             S.tgt.plr = nil
             S.tpRot = 0
+            S.tpLastTarget = nil
             -- cleanup body velocity on death
             if S.speed.bodyVel then
                 pcall(function() S.speed.bodyVel:Destroy() end)
                 S.speed.bodyVel = nil
             end
-            -- disable speed hack on death to prevent issues
-            -- (user can re-enable after respawn)
         end)
     end
     if Plr.Character then task.spawn(onChar, Plr.Character) end
@@ -794,7 +806,7 @@ local function InstallSilentHooks()
     local cachedWS = WS
     local cachedCam = Cam
     
-    pcall(function()
+    local hookSuccess, hookErr = pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
             -- THE FASTEST POSSIBLE FILTER
@@ -899,36 +911,164 @@ local function OnAimModeChanged(mode)
     end
 end
 
--- ---- 3rd Person Fix ----
+-- ---- 3rd Person Fix (REWRITTEN v18.2) ----
+-- Цель: в 3rd person камера отдельно от персонажа. Многие игры стреляют 
+-- от рута/головы персонажа, а не от камеры. Эта функция поворачивает 
+-- HumanoidRootPart в направлении цели (или камеры), чтобы пули летели правильно.
+
+-- Проверка, стреляет ли игрок (держит LMB)
+local function IsPlayerShooting()
+    local shooting = false
+    pcall(function()
+        shooting = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    end)
+    -- Также считаем "стрельбой" недавний клик (для burst/semi-auto)
+    if shooting then
+        S.lastShootTime = tick()
+        return true
+    end
+    -- Даём 0.15 сек после отпускания кнопки (для плавности)
+    return (tick() - S.lastShootTime) < 0.15
+end
+
 local function TPFix()
     if not Cfg.TP.On then return end
+    
+    -- Конфликт со SpinBot — SpinBot приоритетнее
+    if Cfg.Spin.On then return end
+    
     if not S.me.alive or not S.me.root or not S.me.root.Parent then
         S.tpRot = 0
+        S.tpLastTarget = nil
+        S.tpLastDir = nil
         return
     end
-    if not S.tgt.part then
+    if not Cam then return end
+    
+    -- Определяем, находимся ли мы в 3rd person
+    -- (расстояние камеры до рута > 1 stud = 3rd person)
+    local camToRoot = (S.me.root.Position - Cam.CFrame.Position).Magnitude
+    if camToRoot < 1 then
+        -- 1st person, не нужен фикс
         S.tpRot = 0
+        S.tpLastDir = nil
         return
     end
-    local dist = (S.me.root.Position - Cam.CFrame.Position).Magnitude
-    if dist > 10 then return end
-    local cl = Cam.CFrame.LookVector
-    local cf = Vector3.new(cl.X, 0, cl.Z)
-    if cf.Magnitude < 0.001 then return end
-    cf = cf.Unit
-    local chl = S.me.root.CFrame.LookVector
-    local chf = Vector3.new(chl.X, 0, chl.Z)
-    if chf.Magnitude < 0.001 then return end
-    chf = chf.Unit
-    local ang = math.deg(math.acos(math.clamp(cf:Dot(chf), -1, 1)))
-    if ang > Cfg.TP.MaxAngle then return end
-    local tgt
-    if cf:Dot(chf) > 0 then tgt = CFrame.new(S.me.root.Position, S.me.root.Position + cf)
-    else tgt = CFrame.new(S.me.root.Position, S.me.root.Position - cf) end
-    S.tpRot = math.min(S.tpRot + Cfg.TP.RotSpeed, 1)
-    local nc = S.me.root.CFrame:Lerp(tgt, S.tpRot)
-    local _, yaw, _ = nc:ToEulerAnglesYXZ()
-    pcall(function() S.me.root.CFrame = CFrame.new(S.me.root.Position) * CFrame.Angles(0, yaw, 0) end)
+    
+    -- Проверяем лимит расстояния камеры (настраиваемый)
+    if camToRoot > Cfg.TP.CamDist then
+        S.tpRot = 0
+        S.tpLastDir = nil
+        return
+    end
+    
+    -- Режим OnlyOnShoot: поворачиваем только когда стреляем
+    if Cfg.TP.OnlyOnShoot then
+        if not IsPlayerShooting() then
+            -- Не стреляем — сбрасываем интерполяцию для следующего раза
+            S.tpRot = 0
+            return
+        end
+    end
+    
+    -- Определяем направление, куда поворачивать персонажа
+    local targetDir = nil
+    local targetChanged = false
+    
+    if S.tgt.part and S.tgt.part.Parent then
+        -- Есть цель аимбота -> поворачиваем к цели
+        local dirToTarget = S.tgt.part.Position - S.me.root.Position
+        local flatDir = Vector3.new(dirToTarget.X, 0, dirToTarget.Z)
+        if flatDir.Magnitude > 0.01 then
+            targetDir = flatDir.Unit
+        end
+        
+        -- Сброс интерполяции при смене цели
+        if S.tgt.part ~= S.tpLastTarget then
+            S.tpRot = 0
+            S.tpLastTarget = S.tgt.part
+            targetChanged = true
+        end
+    elseif Cfg.TP.AlwaysAlign then
+        -- Нет цели, но AlwaysAlign включён -> выравниваем по камере
+        local camLook = Cam.CFrame.LookVector
+        local flatCam = Vector3.new(camLook.X, 0, camLook.Z)
+        if flatCam.Magnitude > 0.01 then
+            targetDir = flatCam.Unit
+        end
+        S.tpLastTarget = nil
+    else
+        -- Нет цели и AlwaysAlign выключен -> ничего не делаем
+        S.tpRot = 0
+        S.tpLastTarget = nil
+        S.tpLastDir = nil
+        return
+    end
+    
+    if not targetDir then return end
+    
+    -- Проверяем, сильно ли изменилось направление (для сброса интерполяции)
+    if S.tpLastDir then
+        local dirChange = targetDir:Dot(S.tpLastDir)
+        if dirChange < 0.7 then -- больше ~45 градусов изменение
+            S.tpRot = 0
+            targetChanged = true
+        end
+    end
+    S.tpLastDir = targetDir
+    
+    -- Вычисляем текущее направление персонажа (flat, без Y)
+    local charLook = S.me.root.CFrame.LookVector
+    local flatChar = Vector3.new(charLook.X, 0, charLook.Z)
+    if flatChar.Magnitude < 0.01 then return end
+    flatChar = flatChar.Unit
+    
+    -- Проверяем угол между текущим направлением и целевым
+    local dotProduct = flatChar:Dot(targetDir)
+    local angle = math.deg(math.acos(math.clamp(dotProduct, -1, 1)))
+    
+    -- Проверка MaxAngle
+    if angle > Cfg.TP.MaxAngle then
+        -- Угол слишком большой, ограничиваем поворот
+        -- (можно либо не поворачивать, либо поворачивать на MaxAngle)
+        -- Пока просто не поворачиваем если угол > MaxAngle
+        return
+    end
+    
+    -- Уже смотрим в нужном направлении?
+    if angle < 0.5 then
+        S.tpRot = 1 -- помечаем что выровнены
+        return
+    end
+    
+    -- Целевой CFrame (только yaw, сохраняем позицию)
+    local targetCF = CFrame.lookAt(
+        S.me.root.Position, 
+        S.me.root.Position + targetDir
+    )
+    
+    -- Режим InstantSnap: мгновенный поворот
+    if Cfg.TP.InstantSnap then
+        local _, yaw, _ = targetCF:ToEulerAnglesYXZ()
+        pcall(function()
+            S.me.root.CFrame = CFrame.new(S.me.root.Position) * CFrame.Angles(0, yaw, 0)
+        end)
+        S.tpRot = 1
+        return
+    end
+    
+    -- Плавная интерполяция
+    -- Используем скорость зависящую от угла — чем больше угол, тем быстрее
+    local speedMult = math.clamp(angle / 45, 0.5, 2)
+    S.tpRot = math.min(S.tpRot + Cfg.TP.RotSpeed * speedMult, 1)
+    
+    -- Извлекаем только yaw из интерполированного CFrame
+    local interpCF = S.me.root.CFrame:Lerp(targetCF, S.tpRot)
+    local _, yaw, _ = interpCF:ToEulerAnglesYXZ()
+    
+    pcall(function()
+        S.me.root.CFrame = CFrame.new(S.me.root.Position) * CFrame.Angles(0, yaw, 0)
+    end)
 end
 
 -- ---- ESP (Drawing API, reusable objects) ----
@@ -1678,7 +1818,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextButton", main)
-    tl.Text = "XENO v18.0 [Eclipse]"
+    tl.Text = "XENO v18.2 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2133,7 +2273,7 @@ local function BuildGUI()
     mkDD (tA, "Bone", {"Head", "UpperTorso", "HumanoidRootPart"}, Cfg.Aim, "Part")
     mkTog(tA, "Sticky Target", Cfg.Aim, "Sticky")
     mkTog(tA, "360 Aim", Cfg.Aim, "Aim360")
-    mkTog(tA, "Visible Check", Cfg.Aim, "VisCheck")  -- отдельная настройка!
+    mkTog(tA, "Visible Check", Cfg.Aim, "VisCheck")
     mkTog(tA, "FOV Circle", Cfg.Aim, "FOVOn")
     mkSld(tA, "FOV Radius", 10, 500, Cfg.Aim, "FOV", "%.0f")
     mkSep(tA, "SPEED / SMOOTH")
@@ -2157,13 +2297,12 @@ local function BuildGUI()
     mkSep(tE, "ESP")
     mkTog(tE, "Enabled", Cfg.ESP, "On", function(v) if not v then E.DelAll() end end)
     mkTog(tE, "Show Team", Cfg.ESP, "ShowTeam")
-    mkTog(tE, "Use Visible Color", Cfg.ESP, "UseVisColor") -- НОВАЯ!
+    mkTog(tE, "Use Visible Color", Cfg.ESP, "UseVisColor")
     mkSld(tE, "Max Distance", 50, 3000, Cfg.ESP, "MaxDist", "%.0f")
     mkSep(tE, "BOX")
     mkTog(tE, "Box", Cfg.Box, "On")
     mkDD (tE, "Style", {"Corner", "Full"}, Cfg.Box, "Style")
     mkSld(tE, "Thickness", 0.5, 5, Cfg.Box, "Thickness", "%.1f")
-    -- Удалил Outline настройку как просил
     mkSep(tE, "NAME")
     mkTog(tE, "Name Tag", Cfg.Name, "On")
     mkDD (tE, "Format", {"Name+Dist", "Name"}, Cfg.Name, "Format")
@@ -2188,10 +2327,14 @@ local function BuildGUI()
 
     -- MISC TAB
     ord = 0
-    mkSep(tM, "CAMERA / TP")
+    mkSep(tM, "3RD PERSON FIX")
     mkTog(tM, "3rd Person Fix", Cfg.TP, "On")
+    mkTog(tM, "Only When Shooting (LMB)", Cfg.TP, "OnlyOnShoot")
+    mkTog(tM, "Instant Snap (no smooth)", Cfg.TP, "InstantSnap")
+    mkTog(tM, "Always Align to Camera", Cfg.TP, "AlwaysAlign")
     mkSld(tM, "Rotation Speed", 0.05, 1, Cfg.TP, "RotSpeed", "%.2f")
-    mkSld(tM, "Max Angle", 5, 180, Cfg.TP, "MaxAngle", "%.0f")
+    mkSld(tM, "Max Camera Dist", 5, 100, Cfg.TP, "CamDist", "%.0f")
+    mkSld(tM, "Max Turn Angle", 10, 180, Cfg.TP, "MaxAngle", "%.0f")
     mkSep(tM, "MOVEMENT")
     mkTog(tM, "SpinBot", Cfg.Spin, "On")
     mkSld(tM, "Spin Speed", 1, 50, Cfg.Spin, "Spd", "%.0f")
@@ -2219,7 +2362,7 @@ local function BuildGUI()
     
     -- DEBUG LOG BUTTON
     local db = Instance.new("TextButton", tM)
-    db.Text = "📋 COPY DEBUG LOG"
+    db.Text = "COPY DEBUG LOG"
     db.Size = UDim2.new(1, 0, 0, SC(26, 32))
     db.BackgroundColor3 = Color3.fromRGB(80, 80, 120)
     db.TextColor3 = Color3.new(1, 1, 1)
@@ -2235,14 +2378,12 @@ local function BuildGUI()
     db.MouseButton1Click:Connect(function()
         CopyDebugLog()
     end)
-    -- Самый надежный метод для мобилок/eclipse
     db.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
             CopyDebugLog()
         end
     end)
     
-    -- Live stats removed for performance. Use the copy button.
     local infoLbl = Instance.new("TextLabel", tM)
     infoLbl.Text = "Stats included in debug report"
     infoLbl.Size = UDim2.new(1, 0, 0, 14)
@@ -2591,7 +2732,8 @@ local function MainLoop()
         end
         -- Trigger Bot
         UpdateTriggerBot()
-        if Cfg.TP.On and S.me.alive and S.me.root and S.tgt.part then TPFix() end
+        -- 3rd Person Fix: now works ALWAYS when enabled (not just with target)
+        if Cfg.TP.On and S.me.alive and S.me.root then TPFix() end
         ApplyMovement(dt)
         E.UpdateBatch()
         local hudRate = Cfg.Tick.HUD
@@ -2628,4 +2770,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
-Notify("XENO v18.0", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v18.2", "Loaded [Eclipse]. Tap X button to open menu.", 5)
