@@ -9,10 +9,7 @@ local RunService = game:GetService("RunService")
 local WS         = game:GetService("Workspace")
 local StarterGui = game:GetService("StarterGui")
 local CoreGui    = game:GetService("CoreGui")
-local VIM = nil
-pcall(function()
-    VIM = game:GetService("VirtualInputManager")
-end)
+local VIM        = game:GetService("VirtualInputManager")
 
 local Plr   = Players.LocalPlayer
 local Cam   = WS.CurrentCamera
@@ -784,49 +781,72 @@ end
 
 local function InstallSilentHooks()
     if S.magic.hookInstalled then return end
-    if not Exec.canSilent then return end
+    
+    if not Exec.canSilent then
+        Notify("SILENT/MAGIC", "Not supported", 3)
+        return
+    end
     
     S.magic.hookInstalled = true
     DebugLog.hookStats.installed = true
     local wrap = newcclosure or function(f) return f end
     
-    -- Localize globals for speed
-    local cachedWS = game:GetService("Workspace")
-    local cachedCam = cachedWS.CurrentCamera
+    local cachedWS = WS
+    local cachedCam = Cam
     
     pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            -- 1. MEGA FAST BYPASS (Normal/Snap modes)
-            -- If user is NOT using Silent and NOT using Magic Bullet, 
-            -- we do ZERO logic and just return. This saves FPS.
-            local magicActive = S.magic.on
-            local silentActive = (Cfg.Aim.On and Cfg.Aim.Mode == "Silent")
-            
-            if not magicActive and not silentActive then
-                return oldNc(self, ...)
-            end
-
-            -- 2. TARGET FILTER
-            if self == cachedWS and magicActive then
+            -- THE FASTEST POSSIBLE FILTER
+            if self == cachedWS then
+                local magicOn = S.magic.on
+                if not magicOn then return oldNc(self, ...) end
+                
                 local method = getnamecallmethod()
-                if method == "Raycast" then
+                -- Only care about raycasting
+                if method == "Raycast" or method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
                     local args = {...}
-                    local origin = args[1]
-                    local dir = args[2]
-                    -- Ignore non-vector or short rays (optimization)
-                    if not origin or not dir then return oldNc(self, ...) end
+                    local origin, direction, mag
                     
-                    local tp = GetSilentAimTarget()
-                    if tp then
-                        local d = (tp.Position - origin)
-                        DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
-                        return oldNc(self, origin, d.Unit * dir.Magnitude, args[3])
+                    if method == "Raycast" then
+                        origin = args[1]
+                        direction = args[2]
+                        if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return oldNc(self, ...) end
+                        mag = direction.Magnitude
+                    else
+                        local ray = args[1]
+                        if typeof(ray) ~= "Ray" then return oldNc(self, ...) end
+                        origin = ray.Origin
+                        direction = ray.Direction
+                        mag = direction.Magnitude
+                    end
+
+                    -- Optimization: Only redirect "long" rays (bullets), ignore short ones (footsteps/interact)
+                    if mag < 5 then return oldNc(self, ...) end
+
+                    -- Check if origin is from player
+                    local isPlayer = (S.me.root and (origin - S.me.root.Position).Magnitude < 50)
+                                  or (cachedCam and (origin - cachedCam.CFrame.Position).Magnitude < 20)
+                    
+                    if isPlayer then
+                        local tp = GetSilentAimTarget()
+                        if tp then
+                            local newDir = (tp.Position - origin).Unit * mag
+                            DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                            if method == "Raycast" then
+                                return oldNc(self, origin, newDir, select(3, ...))
+                            else
+                                return oldNc(self, Ray.new(origin, newDir), select(2, ...))
+                            end
+                        end
                     end
                 end
-            elseif self == cachedCam and silentActive then
+            elseif self == cachedCam then
+                local silentOn = Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
+                if not silentOn then return oldNc(self, ...) end
+                
                 local method = getnamecallmethod()
-                if method == "GetRenderCFrame" or method == "GetCFrame" then
+                if method == "GetRenderCFrame" or method == "GetCFrame" or method == "get_CFrame" then
                     local tp = GetSilentAimTarget()
                     if tp then
                         DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
@@ -838,12 +858,6 @@ local function InstallSilentHooks()
             return oldNc(self, ...)
         end))
     end)
-    
-    -- Sync camera
-    cachedWS:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-        cachedCam = cachedWS.CurrentCamera
-    end)
-end
     
     if not hookSuccess then
         Log("HOOK", "hookmetamethod FAILED: " .. tostring(hookErr))
@@ -2614,11 +2628,4 @@ HUD.Create()
 BuildGUI()
 MainLoop()
 
--- Fallback chat command
-Plr.Chatted:Connect(function(msg)
-    if msg:lower() == "/e log" or msg:lower() == "!log" then
-        CopyDebugLog()
-    end
-end)
-
-Notify("XENO v18.1", "Loaded. Type /e log to copy debug if button fails.", 5)
+Notify("XENO v18.0", "Loaded [Eclipse]. Tap X button to open menu.", 5)
