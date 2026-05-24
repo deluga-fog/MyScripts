@@ -79,7 +79,7 @@ end
 
 local function GetDebugReport()
     local lines = {}
-    table.insert(lines, "===== XENO v18.2 DEBUG REPORT =====")
+    table.insert(lines, "===== XENO v18.3 DEBUG REPORT =====")
     table.insert(lines, "Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
     table.insert(lines, "")
     
@@ -294,7 +294,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v18.2 [Eclipse]...", 3)
+Notify("XENO", "Loading v18.3 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -646,15 +646,17 @@ local function ApplyAim(p)
     if not p or not Cam then return end
     
     -- Silent mode: don't move camera visually, hooks handle it
+    -- Камера остаётся на месте, Mouse.Hit/Raycast перенаправляются хуками
     if Cfg.Aim.Mode == "Silent" then
-        -- just make sure hooks are installed
+        -- Убеждаемся что хуки установлены
         if not S.magic.hookInstalled then
             InstallSilentHooks()
         end
+        -- НЕ двигаем камеру — хуки делают всю работу
         return
     end
     
-    -- Minimal mode: snap instantly
+    -- Minimal mode: snap instantly (мгновенный наведение)
     if Cfg.Aim.Mode == "Minimal" then
         local tcf = MakeCF(p)
         if tcf then
@@ -663,7 +665,7 @@ local function ApplyAim(p)
         return
     end
     
-    -- Normal mode: smooth aim
+    -- Normal mode: smooth aim (плавное наведение)
     local tcf = MakeCF(p)
     if not tcf then return end
     local sm = math.clamp(Cfg.Aim.Smooth, 0, 100)
@@ -734,136 +736,115 @@ local function UpdateTriggerBot()
     end
 end
 
--- ---- Silent Aim / Magic Bullet System ----
--- Silent Aim = подменяет камеру для игры, но визуально ты смотришь в другую сторону
--- Magic Bullet = перенаправляет Raycast/FindPartOnRay на голову врага
+-- ---- Silent Aim / Magic Bullet System (REWRITTEN v18.3) ----
+-- Портировано из v10.1 с улучшениями:
+-- 1. __namecall хук для Raycast/FindPartOnRay (Magic Bullet)
+-- 2. __index хук для Mouse.Hit/Target/UnitRay (Silent Aim)
+-- 3. Единая функция ShouldRedirect() для всех проверок
+-- 4. Prediction поддержка в хуках
 
-local function FindBestTarget()
-    if not S.me.alive or not S.me.root then return nil, nil end
-    local best, bestD, bestPart = nil, Cfg.MagicBullet.Range, nil
+-- Быстрая проверка: нужно ли перенаправлять?
+local function ShouldRedirect()
+    if DEAD then return false end
+    -- Silent Aim active?
+    local silentActive = Cfg.Aim.On and Cfg.Aim.Mode == "Silent" and S.tgt.part and S.tgt.vis
+    -- Magic Bullet active?
+    local magicActive = S.magic.on and S.tgt.part
     
-    for _, tp in ipairs(S.plList) do
-        repeat
-            if tp == Plr then break end
-            local ch = tp.Character
-            if not ch or not ch.Parent then break end
-            if Cfg.Checks.Team and TeamEq(Plr, tp) then break end
-            if GetHP(ch) <= 0 then break end
-            
-            -- get target bone based on aim settings
-            local targetPart = ch:FindFirstChild(Cfg.Aim.Part) or ch:FindFirstChild("Head")
-            if not targetPart then break end
-            
-            local d = (targetPart.Position - S.me.root.Position).Magnitude
-            if d < bestD then
-                if not Cfg.Checks.Wall or CanSee(targetPart, S.me.char) then
-                    best = tp
-                    bestD = d
-                    bestPart = targetPart
-                end
-            end
-        until true
-    end
-    return bestPart, best
+    return silentActive or magicActive
 end
 
-local silentCache = {part = nil, tick = 0}
-
-local function GetSilentAimTarget()
-    -- FAST: use current aim target directly (updated every frame in main loop)
-    -- no heavy FindBestTarget in hook — just return what we already have
+-- Получить целевую позицию (с prediction если включён)
+local function GetRedirectPos()
     local p = S.tgt.part
-    if p and p.Parent then
-        return p
-    end
-    
-    -- fallback: cached search, max once per 0.1s
-    local now = tick()
-    if now - silentCache.tick < 0.1 then
-        local cp = silentCache.part
-        if cp and cp.Parent then return cp end
-        return nil
-    end
-    
-    silentCache.tick = now
-    local part, _ = FindBestTarget()
-    silentCache.part = part
-    return part
+    if not p or not p.Parent then return nil end
+    return PredPos(p)
+end
+
+-- Получить целевой Part
+local function GetRedirectPart()
+    local p = S.tgt.part
+    if p and p.Parent then return p end
+    return nil
 end
 
 local function InstallSilentHooks()
     if S.magic.hookInstalled then return end
     
     if not Exec.canSilent then
-        Notify("SILENT/MAGIC", "Not supported", 3)
+        Log("HOOK", "hookmetamethod not available, Silent/Magic not supported")
+        Notify("SILENT/MAGIC", "Not supported on " .. Exec.name, 3)
         return
     end
     
     S.magic.hookInstalled = true
     DebugLog.hookStats.installed = true
+    Log("HOOK", "Installing hooks...")
+    
     local wrap = newcclosure or function(f) return f end
+    local cachedMouse = Mouse
     
-    local cachedWS = WS
-    local cachedCam = Cam
-    
-    local hookSuccess, hookErr = pcall(function()
+    -- ==========================================
+    -- HOOK 1: __namecall (Raycast/FindPartOnRay)
+    -- Перехватывает вызовы рейкастов и перенаправляет их на цель
+    -- ==========================================
+    local ncSuccess, ncErr = pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            -- THE FASTEST POSSIBLE FILTER
-            if self == cachedWS then
-                local magicOn = S.magic.on
-                if not magicOn then return oldNc(self, ...) end
-                
-                local method = getnamecallmethod()
-                -- Only care about raycasting
-                if method == "Raycast" or method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
-                    local args = {...}
-                    local origin, direction, mag
-                    
-                    if method == "Raycast" then
-                        origin = args[1]
-                        direction = args[2]
-                        if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return oldNc(self, ...) end
-                        mag = direction.Magnitude
-                    else
-                        local ray = args[1]
-                        if typeof(ray) ~= "Ray" then return oldNc(self, ...) end
-                        origin = ray.Origin
-                        direction = ray.Direction
-                        mag = direction.Magnitude
-                    end
-
-                    -- Optimization: Only redirect "long" rays (bullets), ignore short ones (footsteps/interact)
+            if DEAD then return oldNc(self, ...) end
+            
+            -- Быстрый фильтр: только Workspace вызовы
+            if self ~= WS then return oldNc(self, ...) end
+            
+            -- Проверяем, нужно ли перенаправлять
+            if not ShouldRedirect() then return oldNc(self, ...) end
+            
+            local method = getnamecallmethod()
+            local tp = GetRedirectPos()
+            if not tp then return oldNc(self, ...) end
+            
+            -- Workspace:Raycast(origin, direction, params)
+            if method == "Raycast" then
+                local args = {...}
+                if #args >= 2 and typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
+                    local origin = args[1]
+                    local dir = args[2]
+                    local mag = dir.Magnitude
+                    -- Игнорируем короткие рейкасты (не выстрелы)
                     if mag < 5 then return oldNc(self, ...) end
-
-                    -- Check if origin is from player
-                    local isPlayer = (S.me.root and (origin - S.me.root.Position).Magnitude < 50)
-                                  or (cachedCam and (origin - cachedCam.CFrame.Position).Magnitude < 20)
-                    
-                    if isPlayer then
-                        local tp = GetSilentAimTarget()
-                        if tp then
-                            local newDir = (tp.Position - origin).Unit * mag
-                            DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
-                            if method == "Raycast" then
-                                return oldNc(self, origin, newDir, select(3, ...))
-                            else
-                                return oldNc(self, Ray.new(origin, newDir), select(2, ...))
-                            end
-                        end
+                    -- Проверяем, что рейкаст от игрока
+                    local fromPlayer = false
+                    if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then fromPlayer = true end
+                    if Cam and (origin - Cam.CFrame.Position).Magnitude < 20 then fromPlayer = true end
+                    if not fromPlayer then return oldNc(self, ...) end
+                    -- Перенаправляем!
+                    local newDir = (tp - origin)
+                    if newDir.Magnitude > 0.001 then
+                        newDir = newDir.Unit * mag
                     end
+                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                    return oldNc(self, origin, newDir, select(3, ...))
                 end
-            elseif self == cachedCam then
-                local silentOn = Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
-                if not silentOn then return oldNc(self, ...) end
-                
-                local method = getnamecallmethod()
-                if method == "GetRenderCFrame" or method == "GetCFrame" or method == "get_CFrame" then
-                    local tp = GetSilentAimTarget()
-                    if tp then
-                        DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
-                        return CFrame.lookAt(cachedCam.CFrame.Position, tp.Position)
+            end
+            
+            -- Workspace:FindPartOnRay / FindPartOnRayWithIgnoreList / FindPartOnRayWithWhitelist
+            if method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
+                local args = {...}
+                if typeof(args[1]) == "Ray" then
+                    local ray = args[1]
+                    local origin = ray.Origin
+                    local mag = ray.Direction.Magnitude
+                    if mag < 5 then return oldNc(self, ...) end
+                    local fromPlayer = false
+                    if S.me.root and (origin - S.me.root.Position).Magnitude < 50 then fromPlayer = true end
+                    if Cam and (origin - Cam.CFrame.Position).Magnitude < 20 then fromPlayer = true end
+                    if not fromPlayer then return oldNc(self, ...) end
+                    local newDir = (tp - origin)
+                    if newDir.Magnitude > 0.001 then
+                        newDir = newDir.Unit * mag
                     end
+                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                    return oldNc(self, Ray.new(origin, newDir), select(2, ...))
                 end
             end
             
@@ -871,23 +852,92 @@ local function InstallSilentHooks()
         end))
     end)
     
-    if not hookSuccess then
-        Log("HOOK", "hookmetamethod FAILED: " .. tostring(hookErr))
-        LogError("HOOK", hookErr)
-        DebugLog.hookStats.installed = false
-        S.magic.hookInstalled = false
-        Notify("HOOK ERROR", tostring(hookErr):sub(1, 50), 5)
-        return
+    if ncSuccess then
+        Log("HOOK", "__namecall hook installed OK")
+    else
+        Log("HOOK", "__namecall hook FAILED: " .. tostring(ncErr))
+        LogError("HOOK", ncErr)
     end
     
-    -- Update cached camera when it changes
-    table.insert(S.conns, WS:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-        cachedCam = WS.CurrentCamera
-        Log("HOOK", "Camera updated: " .. tostring(cachedCam))
-    end))
+    -- ==========================================
+    -- HOOK 2: __index (Mouse.Hit, Mouse.Target, Mouse.UnitRay)
+    -- Многие игры используют Mouse.Hit для определения куда стреляет игрок
+    -- Это КРИТИЧЕСКИ ВАЖНО для Silent Aim!
+    -- ==========================================
+    local idxSuccess, idxErr = pcall(function()
+        local oldIdx
+        oldIdx = hookmetamethod(game, "__index", wrap(function(self, key)
+            if DEAD then return oldIdx(self, key) end
+            
+            -- Быстрый фильтр: только Mouse
+            if self ~= cachedMouse then return oldIdx(self, key) end
+            
+            -- Проверяем нужно ли перенаправлять
+            if not ShouldRedirect() then return oldIdx(self, key) end
+            
+            local tp = GetRedirectPos()
+            if not tp then return oldIdx(self, key) end
+            
+            -- Mouse.Hit -> CFrame указывающий на цель
+            if key == "Hit" then
+                DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                return CFrame.new(tp)
+            end
+            
+            -- Mouse.Target -> Part цели
+            if key == "Target" then
+                local part = GetRedirectPart()
+                if part then
+                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                    return part
+                end
+            end
+            
+            -- Mouse.UnitRay -> луч от камеры к цели
+            if key == "UnitRay" then
+                if Cam then
+                    local camPos = Cam.CFrame.Position
+                    local dir = tp - camPos
+                    if dir.Magnitude > 0.001 then
+                        DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                        return Ray.new(camPos, dir.Unit)
+                    end
+                end
+            end
+            
+            -- Mouse.X / Mouse.Y -> координаты цели на экране
+            if key == "X" or key == "Y" then
+                local sp, on = W2S(tp)
+                if sp and on then
+                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                    if key == "X" then return sp.X end
+                    if key == "Y" then return sp.Y end
+                end
+            end
+            
+            return oldIdx(self, key)
+        end))
+    end)
     
-    Log("HOOK", "Installation complete!")
-    Notify("SILENT/MAGIC", "Hooks installed", 2)
+    if idxSuccess then
+        Log("HOOK", "__index hook installed OK")
+    else
+        Log("HOOK", "__index hook FAILED: " .. tostring(idxErr))
+        LogError("HOOK", idxErr)
+    end
+    
+    -- Итоговый результат
+    if ncSuccess or idxSuccess then
+        local parts = {}
+        if ncSuccess then table.insert(parts, "Raycast") end
+        if idxSuccess then table.insert(parts, "Mouse") end
+        Log("HOOK", "Hooks installed: " .. table.concat(parts, " + "))
+        Notify("HOOKS", table.concat(parts, " + ") .. " OK", 3)
+    else
+        S.magic.hookInstalled = false
+        DebugLog.hookStats.installed = false
+        Notify("HOOK ERROR", "All hooks failed!", 5)
+    end
 end
 
 local function ToggleMagicBullet()
@@ -905,8 +955,8 @@ end
 -- Install hooks when Silent mode is selected
 local function OnAimModeChanged(mode)
     Log("AIM", "Mode changed to: " .. tostring(mode))
-    if mode == "Silent" and not S.magic.hookInstalled then
-        Log("AIM", "Silent mode, installing hooks...")
+    if (mode == "Silent") and not S.magic.hookInstalled then
+        Log("AIM", "Silent/Magic mode, installing hooks...")
         InstallSilentHooks()
     end
 end
@@ -1818,7 +1868,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextButton", main)
-    tl.Text = "XENO v18.2 [Eclipse]"
+    tl.Text = "XENO v18.3 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2701,7 +2751,9 @@ local function MainLoop()
         local aimRate = Cfg.Tick.Aim
         if aimRate < 1 then aimRate = 1 end
         if S.frame % aimRate == 0 then
-            if Cfg.Aim.On and S.me.alive and S.me.root then
+            -- Ищем таргет если аимбот ВКЛ или Magic Bullet ВКЛ
+            local needTarget = (Cfg.Aim.On or S.magic.on) and S.me.alive and S.me.root
+            if needTarget then
                 local part, plr = FindTarget()
                 if part then
                     S.tgt.part = part
@@ -2711,7 +2763,10 @@ local function MainLoop()
                     S.tgt.vis = true
                     local ch = plr and plr.Character
                     if ch then S.tgt.hp = GetHP(ch) end
-                    ApplyAim(part)
+                    -- Применяем наведение камеры (только если аимбот ВКЛ)
+                    if Cfg.Aim.On then
+                        ApplyAim(part)
+                    end
                 else
                     if not Cfg.Aim.Sticky then
                         S.tgt.part = nil
@@ -2767,7 +2822,15 @@ end))
 SetupChar()
 task.wait(0.5)
 HUD.Create()
+
+-- Устанавливаем хуки при загрузке если Silent режим выбран или Magic Bullet включён
+if Exec.canSilent and (Cfg.Aim.Mode == "Silent" or Cfg.MagicBullet.On) then
+    Log("INIT", "Pre-installing hooks (Silent/Magic enabled)")
+    InstallSilentHooks()
+end
+
 BuildGUI()
 MainLoop()
 
-Notify("XENO v18.2", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v18.3", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Log("INIT", "Script fully loaded")
