@@ -55,6 +55,7 @@ local DebugLog = {
         wsCalls = 0,
         camCalls = 0,
         redirects = 0,
+        lastRedirectTick = 0,  -- для визуальной индикации
         errors = {},
         lastCallTime = 0,
     },
@@ -79,7 +80,7 @@ end
 
 local function GetDebugReport()
     local lines = {}
-    table.insert(lines, "===== XENO v18.4 DEBUG REPORT =====")
+    table.insert(lines, "===== XENO v18.5 DEBUG REPORT =====")
     table.insert(lines, "Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
     table.insert(lines, "")
     
@@ -294,7 +295,7 @@ task.spawn(function()
     InitClickMethod()
 end)
 
-Notify("XENO", "Loading v18.4 [Eclipse]...", 3)
+Notify("XENO", "Loading v18.5 [Eclipse]...", 3)
 
 -- ---- Config ----
 local Cfg = {
@@ -768,6 +769,12 @@ local function GetRedirectPart()
     return nil
 end
 
+-- Записать что был редирект (для визуализации)
+local function LogRedirect()
+    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+    DebugLog.hookStats.lastRedirectTick = tick()
+end
+
 local function InstallSilentHooks()
     if S.magic.hookInstalled then return end
     
@@ -831,7 +838,7 @@ local function InstallSilentHooks()
                     
                     -- Если попали — отлично!
                     if result then
-                        DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                        LogRedirect()
                         return result
                     end
                     
@@ -843,7 +850,7 @@ local function InstallSilentHooks()
                     
                     local directResult = WS:Raycast(origin, (tp - origin).Unit * 1000, directParams)
                     if directResult then
-                        DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                        LogRedirect()
                         return directResult
                     end
                     
@@ -876,12 +883,12 @@ local function InstallSilentHooks()
                     local hitPart, hitPos, hitNormal, hitMaterial = oldNc(self, newRay, select(2, ...))
                     
                     if hitPart then
-                        DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                        LogRedirect()
                         return hitPart, hitPos, hitNormal, hitMaterial
                     end
                     
                     -- Фоллбэк: возвращаем целевой Part напрямую
-                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                    LogRedirect()
                     return targetPart, tp, Vector3.new(0, 1, 0), Enum.Material.Plastic
                 end
             end
@@ -918,7 +925,7 @@ local function InstallSilentHooks()
             
             -- Mouse.Hit -> CFrame указывающий на цель
             if key == "Hit" then
-                DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                LogRedirect()
                 return CFrame.new(tp)
             end
             
@@ -926,7 +933,7 @@ local function InstallSilentHooks()
             if key == "Target" then
                 local part = GetRedirectPart()
                 if part then
-                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                    LogRedirect()
                     return part
                 end
             end
@@ -937,7 +944,7 @@ local function InstallSilentHooks()
                     local camPos = Cam.CFrame.Position
                     local dir = tp - camPos
                     if dir.Magnitude > 0.001 then
-                        DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                        LogRedirect()
                         return Ray.new(camPos, dir.Unit)
                     end
                 end
@@ -947,7 +954,7 @@ local function InstallSilentHooks()
             if key == "X" or key == "Y" then
                 local sp, on = W2S(tp)
                 if sp and on then
-                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                    LogRedirect()
                     if key == "X" then return sp.X end
                     if key == "Y" then return sp.Y end
                 end
@@ -987,7 +994,7 @@ local function InstallSilentHooks()
             if self == Cam and key == "CFrame" then
                 local realCF = oldIdx2(self, key)
                 local fakeCF = CFrame.lookAt(realCF.Position, tp)
-                DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                LogRedirect()
                 return fakeCF
             end
             
@@ -996,7 +1003,7 @@ local function InstallSilentHooks()
                 local camPos = Cam and Cam.CFrame.Position or Vector3.zero
                 local dir = (tp - camPos)
                 if dir.Magnitude > 0.001 then
-                    DebugLog.hookStats.redirects = DebugLog.hookStats.redirects + 1
+                    LogRedirect()
                     return dir.Unit
                 end
             end
@@ -1687,6 +1694,28 @@ function HUD.Create()
             S.draw.tb.Color = Color3.fromRGB(255, 200, 50)
         end)
     end
+    -- HOOK REDIRECTS INDICATOR
+    S.draw.hooks = ND("Text")
+    if S.draw.hooks then
+        pcall(function()
+            S.draw.hooks.Center = false
+            S.draw.hooks.Outline = true
+            S.draw.hooks.Size = SC(11, 10)
+            S.draw.hooks.Position = Vector2.new(10, SC(78, 108))
+            S.draw.hooks.Color = Color3.fromRGB(180, 100, 255)
+        end)
+    end
+    -- SILENT/MAGIC STATUS
+    S.draw.silentSt = ND("Text")
+    if S.draw.silentSt then
+        pcall(function()
+            S.draw.silentSt.Center = false
+            S.draw.silentSt.Outline = true
+            S.draw.silentSt.Size = SC(10, 9)
+            S.draw.silentSt.Position = Vector2.new(10, SC(92, 122))
+            S.draw.silentSt.Color = Color3.fromRGB(100, 200, 255)
+        end)
+    end
 end
 
 function HUD.Update()
@@ -1756,6 +1785,52 @@ function HUD.Update()
             end)
         else
             pcall(function() d.tb.Visible = false end)
+        end
+    end
+    -- HOOKS INDICATOR
+    if d.hooks then
+        local showHooks = S.magic.hookInstalled and (S.magic.on or Cfg.Aim.Mode == "Silent")
+        if showHooks then
+            local redirects = DebugLog.hookStats.redirects
+            local lastRedirect = DebugLog.hookStats.lastRedirectTick or 0
+            local timeSinceRedirect = tick() - lastRedirect
+            pcall(function()
+                d.hooks.Text = string.format("HOOKS: %d redirects", redirects)
+                -- Зелёный если был редирект в последние 0.5 сек
+                if timeSinceRedirect < 0.5 then
+                    d.hooks.Color = Color3.fromRGB(50, 255, 50)
+                elseif timeSinceRedirect < 2 then
+                    d.hooks.Color = Color3.fromRGB(100, 255, 100)
+                else
+                    d.hooks.Color = Color3.fromRGB(180, 100, 255)
+                end
+                d.hooks.Visible = true
+            end)
+        else
+            pcall(function() d.hooks.Visible = false end)
+        end
+    end
+    -- SILENT/MAGIC STATUS LINE
+    if d.silentSt then
+        local isSilent = Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
+        local isMagic = S.magic.on
+        if isSilent or isMagic then
+            local parts = {}
+            if isSilent then table.insert(parts, "SILENT") end
+            if isMagic then table.insert(parts, "MAGIC") end
+            local status = table.concat(parts, "+")
+            if S.tgt.part then
+                status = status .. " -> " .. (S.tgt.name ~= "" and S.tgt.name or "target")
+            else
+                status = status .. " [no target]"
+            end
+            pcall(function()
+                d.silentSt.Text = status
+                d.silentSt.Color = S.tgt.part and Color3.fromRGB(100, 255, 150) or Color3.fromRGB(255, 150, 100)
+                d.silentSt.Visible = true
+            end)
+        else
+            pcall(function() d.silentSt.Visible = false end)
         end
     end
     if Cfg.Aim.On and S.tgt.part and S.tgt.vis then
@@ -1967,7 +2042,7 @@ local function BuildGUI()
     table.insert(S.theme.bg, main)
 
     local tl = Instance.new("TextButton", main)
-    tl.Text = "XENO v18.4 [Eclipse]"
+    tl.Text = "XENO v18.5 [Eclipse]"
     tl.Size = UDim2.new(1, -100, 0, 28)
     tl.Position = UDim2.new(0, 10, 0, 4)
     tl.BackgroundTransparency = 1
@@ -2931,5 +3006,5 @@ end
 BuildGUI()
 MainLoop()
 
-Notify("XENO v18.4", "Loaded [Eclipse]. Tap X button to open menu.", 5)
+Notify("XENO v18.5", "Loaded [Eclipse]. Tap X button to open menu.", 5)
 Log("INIT", "Script fully loaded")
