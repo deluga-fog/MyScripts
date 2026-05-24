@@ -360,7 +360,7 @@ local Cfg = {
     Checks = {Team = true, Wall = true},
     Limits = {MaxDist = 800, MaxAngle = 90, MinDist = 5},
     MagicBullet = {On = false, Range = 300},
-    Tick = {ESP = 3, WH = 5, HUD = 2, Aim = 1},
+    Tick = {ESP = SC(3, 6), WH = SC(5, 10), HUD = SC(2, 3), Aim = 1},
     UI = {
         Accent     = Color3.fromRGB(90, 130, 255),
         Background = Color3.fromRGB(20, 20, 28),
@@ -447,6 +447,9 @@ local function GetRoot(ch)
     return ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("Torso") or ch.PrimaryPart
 end
 
+-- Флаг чтобы наши собственные рейкасты не перехватывались хуками
+local _internalRaycast = false
+
 local function CanSee(part, myCh)
     if not part or not myCh or not Cam then return true end
     local ok, res = pcall(function()
@@ -460,7 +463,9 @@ local function CanSee(part, myCh)
         if tCh then par.FilterDescendantsInstances = {myCh, tCh}
         else par.FilterDescendantsInstances = {myCh} end
         par.RespectCanCollide = false
+        _internalRaycast = true
         local r = WS:Raycast(origin, dir.Unit * (dist - 1), par)
+        _internalRaycast = false
         if not r then return true end
         return r.Instance.Transparency >= 0.5 or not r.Instance.CanCollide
     end)
@@ -799,18 +804,29 @@ local function InstallSilentHooks()
     local ncSuccess, ncErr = pcall(function()
         local oldNc
         oldNc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            -- БЫСТРЫЙ early-out: rawequal не триггерит метаметоды
+            if not rawequal(self, WS) then return oldNc(self, ...) end
             if DEAD then return oldNc(self, ...) end
+            -- Не перехватываем наши собственные рейкасты (CanSee и т.д.)
+            if _internalRaycast then return oldNc(self, ...) end
             
-            -- Быстрый фильтр: только Workspace вызовы
-            if self ~= WS then return oldNc(self, ...) end
+            -- Inline ShouldRedirect: избегаем вызова функции
+            local silentOk = Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
+            local magicOk = S.magic.on
+            if not silentOk and not magicOk then return oldNc(self, ...) end
             
-            -- Проверяем, нужно ли перенаправлять
-            if not ShouldRedirect() then return oldNc(self, ...) end
+            local p = S.tgt.part
+            if not p or not p.Parent then return oldNc(self, ...) end
             
             local method = getnamecallmethod()
-            local targetPart = GetRedirectPart()
-            local tp = GetRedirectPos()
-            if not tp or not targetPart then return oldNc(self, ...) end
+            -- Быстрый фильтр метода: только рейкасты
+            if method ~= "Raycast" and method ~= "FindPartOnRay" and method ~= "FindPartOnRayWithIgnoreList" and method ~= "FindPartOnRayWithWhitelist" then
+                return oldNc(self, ...)
+            end
+            
+            local targetPart = p
+            local tp = PredPos(p)
+            if not tp then return oldNc(self, ...) end
             
             -- Workspace:Raycast(origin, direction, params)
             if method == "Raycast" then
@@ -844,11 +860,13 @@ local function InstallSilentHooks()
                     
                     -- Если НЕ попали (стена, etc) — создаём фейковый результат
                     -- Делаем рейкаст БЕЗ параметров чтобы точно попасть в цель
+                    _internalRaycast = true
                     local directParams = RaycastParams.new()
                     directParams.FilterType = Enum.RaycastFilterType.Include
                     directParams.FilterDescendantsInstances = {targetPart.Parent}
                     
                     local directResult = WS:Raycast(origin, (tp - origin).Unit * 1000, directParams)
+                    _internalRaycast = false
                     if directResult then
                         LogRedirect()
                         return directResult
@@ -906,120 +924,77 @@ local function InstallSilentHooks()
     
     -- ==========================================
     -- HOOK 2: __index (Mouse.Hit, Mouse.Target, Mouse.UnitRay)
-    -- Многие игры используют Mouse.Hit для определения куда стреляет игрок
-    -- Это КРИТИЧЕСКИ ВАЖНО для Silent Aim!
+    -- ОПТИМИЗИРОВАНО: checkedcall_enabled флаг для мгновенного early-out
+    -- hookmetamethod __index вызывается на КАЖДОЕ обращение к свойствам
+    -- поэтому фильтр должен быть МАКСИМАЛЬНО быстрым
     -- ==========================================
     local idxSuccess, idxErr = pcall(function()
         local oldIdx
         oldIdx = hookmetamethod(game, "__index", wrap(function(self, key)
-            if DEAD then return oldIdx(self, key) end
-            
-            -- Быстрый фильтр: только Mouse
-            if self ~= cachedMouse then return oldIdx(self, key) end
-            
-            -- Проверяем нужно ли перенаправлять
-            if not ShouldRedirect() then return oldIdx(self, key) end
-            
-            local tp = GetRedirectPos()
-            if not tp then return oldIdx(self, key) end
-            
-            -- Mouse.Hit -> CFrame указывающий на цель
-            if key == "Hit" then
-                LogRedirect()
-                return CFrame.new(tp)
-            end
-            
-            -- Mouse.Target -> Part цели
-            if key == "Target" then
-                local part = GetRedirectPart()
-                if part then
-                    LogRedirect()
-                    return part
+            -- УЛЬТРА-БЫСТРЫЙ фильтр: rawequal не триггерит __index
+            -- Проверяем ТОЛЬКО Mouse, всё остальное пропускаем мгновенно
+            if rawequal(self, cachedMouse) then
+                -- Второй фильтр: только нужные ключи (строковое сравнение дешевле функций)
+                if key ~= "Hit" and key ~= "Target" and key ~= "UnitRay" and key ~= "X" and key ~= "Y" then
+                    return oldIdx(self, key)
                 end
-            end
-            
-            -- Mouse.UnitRay -> луч от камеры к цели
-            if key == "UnitRay" then
-                if Cam then
-                    local camPos = Cam.CFrame.Position
-                    local dir = tp - camPos
-                    if dir.Magnitude > 0.001 then
+                
+                -- Проверяем флаги напрямую (без вызова функции ShouldRedirect)
+                if DEAD then return oldIdx(self, key) end
+                
+                local silentOk = Cfg.Aim.On and Cfg.Aim.Mode == "Silent"
+                local magicOk = S.magic.on
+                if not silentOk and not magicOk then return oldIdx(self, key) end
+                
+                local p = S.tgt.part
+                if not p or not p.Parent then return oldIdx(self, key) end
+                if silentOk and not S.tgt.vis then return oldIdx(self, key) end
+                
+                -- Получаем позицию (PredPos вызывается только тут)
+                local tp = PredPos(p)
+                if not tp then return oldIdx(self, key) end
+                
+                if key == "Hit" then
+                    LogRedirect()
+                    return CFrame.new(tp)
+                elseif key == "Target" then
+                    LogRedirect()
+                    return p
+                elseif key == "UnitRay" then
+                    if Cam then
+                        local camPos = Cam.CFrame.Position
+                        local dir = tp - camPos
+                        if dir.Magnitude > 0.001 then
+                            LogRedirect()
+                            return Ray.new(camPos, dir.Unit)
+                        end
+                    end
+                elseif key == "X" or key == "Y" then
+                    local sp, on = W2S(tp)
+                    if sp and on then
                         LogRedirect()
-                        return Ray.new(camPos, dir.Unit)
+                        return key == "X" and sp.X or sp.Y
                     end
                 end
+                
+                return oldIdx(self, key)
             end
             
-            -- Mouse.X / Mouse.Y -> координаты цели на экране
-            if key == "X" or key == "Y" then
-                local sp, on = W2S(tp)
-                if sp and on then
-                    LogRedirect()
-                    if key == "X" then return sp.X end
-                    if key == "Y" then return sp.Y end
-                end
-            end
-            
+            -- Не Mouse — пропускаем мгновенно
             return oldIdx(self, key)
         end))
     end)
     
     if idxSuccess then
-        Log("HOOK", "__index hook installed OK")
+        Log("HOOK", "__index hook installed OK (optimized)")
     else
         Log("HOOK", "__index hook FAILED: " .. tostring(idxErr))
         LogError("HOOK", idxErr)
     end
     
-    -- ==========================================
-    -- HOOK 3: Camera CFrame/LookVector
-    -- Некоторые игры читают Camera.CFrame.LookVector для направления стрельбы
-    -- ==========================================
-    local camSuccess, camErr = pcall(function()
-        local oldIdx2
-        oldIdx2 = hookmetamethod(game, "__index", wrap(function(self, key)
-            if DEAD then return oldIdx2(self, key) end
-            
-            -- Только для камеры
-            if self ~= Cam and (not Cam or self ~= Cam.CFrame) then 
-                return oldIdx2(self, key) 
-            end
-            
-            if not ShouldRedirect() then return oldIdx2(self, key) end
-            
-            local tp = GetRedirectPos()
-            if not tp then return oldIdx2(self, key) end
-            
-            -- Camera.CFrame -> подменяем на CFrame смотрящий на цель
-            if self == Cam and key == "CFrame" then
-                local realCF = oldIdx2(self, key)
-                local fakeCF = CFrame.lookAt(realCF.Position, tp)
-                LogRedirect()
-                return fakeCF
-            end
-            
-            -- CFrame.LookVector -> направление на цель
-            if key == "LookVector" then
-                local camPos = Cam and Cam.CFrame.Position or Vector3.zero
-                local dir = (tp - camPos)
-                if dir.Magnitude > 0.001 then
-                    LogRedirect()
-                    return dir.Unit
-                end
-            end
-            
-            return oldIdx2(self, key)
-        end))
-    end)
-    
-    -- Примечание: Второй __index хук может конфликтовать с первым
-    -- Многие экзекуторы поддерживают только один хук на метаметод
-    -- Поэтому не считаем это критической ошибкой
-    if camSuccess then
-        Log("HOOK", "Camera __index hook installed OK")
-    else
-        Log("HOOK", "Camera hook skipped (expected on some executors)")
-    end
+    -- НЕ ставим Camera __index хук — он вызывает рекурсию и убивает FPS
+    -- Camera перехватывается через __namecall + Mouse.Hit достаточно
+    local camSuccess = false
     
     -- Итоговый результат
     if ncSuccess or idxSuccess then
@@ -1320,10 +1295,16 @@ function E.Render(uid, ch, dname, isTeam)
     end
     local head = ch:FindFirstChild("Head")
     
-    -- VISIBLE COLOR LOGIC
+    -- VISIBLE COLOR LOGIC (кешируем чтобы не делать рейкаст каждый кадр)
     local isVisible = false
     if Cfg.ESP.UseVisColor then
-        isVisible = CanSee(head or rp, S.me.char)
+        -- Кеш: проверяем видимость раз в 10 кадров на игрока
+        if not o._visCache then o._visCache = {vis = false, frame = 0} end
+        if S.frame - o._visCache.frame > 10 then
+            o._visCache.vis = CanSee(head or rp, S.me.char)
+            o._visCache.frame = S.frame
+        end
+        isVisible = o._visCache.vis
     end
 
     local topY = rpPos.Y + 3
